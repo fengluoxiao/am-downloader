@@ -2,7 +2,7 @@
 
 Apple Music Dolby Atmos downloader desktop GUI built with Electron, React and Vite.
 
-This project is a desktop wrapper and workflow tool. The underlying download/decrypt capability is based on [rahulhingve/apple-music-dolby-atmos-downloader](https://github.com/rahulhingve/apple-music-dolby-atmos-downloader). The Apple Music search experience integrates ideas and code paths from the local `amget` project, including song, album, compilation and artist search over Apple Music catalog metadata.
+This project is a desktop wrapper and workflow tool. The underlying download/decrypt capability is based on [rahulhingve/apple-music-dolby-atmos-downloader](https://github.com/rahulhingve/apple-music-dolby-atmos-downloader). The Apple Music search experience integrates ideas and code paths from [fengluoxiao/amget](https://github.com/fengluoxiao/amget), including song, album, compilation and artist search over Apple Music catalog metadata.
 
 ## Features
 
@@ -21,7 +21,7 @@ This project is a desktop wrapper and workflow tool. The underlying download/dec
 This application stands on top of these projects:
 
 - [rahulhingve/apple-music-dolby-atmos-downloader](https://github.com/rahulhingve/apple-music-dolby-atmos-downloader) for the original Apple Music Dolby Atmos downloader and wrapper workflow.
-- `amget` by fengluoxiao for Apple Music catalog search and Dolby Atmos result filtering.
+- [fengluoxiao/amget](https://github.com/fengluoxiao/amget) for Apple Music catalog search and Dolby Atmos result filtering.
 - Electron, React, Vite, Playwright and lucide-react for the desktop app stack.
 
 ## Requirements
