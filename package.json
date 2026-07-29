@@ -1,0 +1,67 @@
+{
+  "name": "am-atmos-downloader-gui",
+  "version": "1.1.1",
+  "private": true,
+  "description": "Apple Music Dolby Atmos downloader desktop GUI",
+  "main": "electron/main.cjs",
+  "author": "fengluoxiao <fengluoxiao@yeah.net>",
+  "homepage": "https://github.com/fengluoxiao/am-downloader",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:vite\" \"npm:dev:electron\"",
+    "dev:vite": "vite",
+    "dev:electron": "wait-on tcp:5173 && electron . --no-sandbox",
+    "build": "vite build",
+    "dist": "vite build && electron-builder --linux deb",
+    "start": "electron . --no-sandbox",
+    "typecheck": "tsc --noEmit"
+  },
+  "build": {
+    "appId": "com.fengluoxiao.amatmosdownloader",
+    "productName": "AM Atmos Downloader",
+    "files": [
+      "electron/**/*",
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build-res/repo",
+        "to": "repo"
+      }
+    ],
+    "linux": {
+      "target": [
+        "deb"
+      ],
+      "category": "Utility",
+      "executableName": "am-atmos-downloader",
+      "description": "Apple Music Dolby Atmos Downloader GUI"
+    },
+    "deb": {
+      "depends": [
+        "libgtk-3-0",
+        "libnss3",
+        "libasound2"
+      ]
+    }
+  },
+  "dependencies": {
+    "dayjs": "^1.11.21",
+    "js-yaml": "^4.1.0",
+    "lucide-react": "^1.27.0",
+    "playwright": "^1.61.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11",
+    "wait-on": "^8.0.1"
+  }
+}
