@@ -8,8 +8,8 @@ import DataTable, { UiColumn } from '../ui/DataTable';
 import Dialog from '../ui/Dialog';
 import Notice from '../ui/Notice';
 import Select from '../ui/Select';
+import Surface from '../ui/Surface';
 import TextInput from '../ui/TextInput';
-import Toolbar from '../ui/Toolbar';
 
 function humanSize(n: number | null) {
   if (n == null) return '-';
@@ -72,6 +72,8 @@ export default function FilesPage() {
   }, [kw, listing]);
   const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
   const selectedEntries = useMemo(() => entries.filter((entry) => selectedSet.has(entry.path)), [entries, selectedSet]);
+  const folderCount = useMemo(() => entries.filter((entry) => entry.type === 'folder').length, [entries]);
+  const fileCount = entries.length - folderCount;
 
   useEffect(() => {
     let alive = true;
@@ -178,50 +180,73 @@ export default function FilesPage() {
   return (
     <div className="files-page">
       {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
-      <Toolbar>
-        <div className="files-toolbar-left">
-          <Select value={listing?.root?.path || ''} options={rootOptions} onChange={(value) => load(value)} />
-          <Button icon={<ArrowUpOutlined />} disabled={!listing?.parent} title="返回上级" onClick={() => listing?.parent && load(listing.parent)} />
-          <Button icon={<ReloadOutlined />} disabled={loading} title="刷新当前文件夹" onClick={() => load(listing?.path)} />
-          <TextInput placeholder="搜索当前文件夹" value={kw} onChange={(e) => setKw(e.target.value)} />
-          <Select value={viewMode} onChange={changeViewMode} options={[{ value: 'grid', label: '图标视图' }, { value: 'list', label: '列表视图' }]} />
+      <Surface className="files-workspace" padded={false}>
+        <div className="files-command-bar">
+          <div className="files-toolbar-left">
+            <Select value={listing?.root?.path || ''} options={rootOptions} onChange={(value) => load(value)} />
+            <Button icon={<ArrowUpOutlined />} disabled={!listing?.parent} title="返回上级" onClick={() => listing?.parent && load(listing.parent)} />
+            <Button icon={<ReloadOutlined />} disabled={loading} title="刷新当前文件夹" onClick={() => load(listing?.path)} />
+            <TextInput placeholder="搜索当前文件夹" value={kw} onChange={(e) => setKw(e.target.value)} />
+          </div>
+          <div className="files-toolbar-right">
+            <Select value={viewMode} onChange={changeViewMode} options={[{ value: 'grid', label: '图标视图' }, { value: 'list', label: '列表视图' }]} />
+            <Button icon={<FolderOpenOutlined />} disabled={!listing?.path} onClick={() => listing?.path && window.api.openFile(listing.path)}>系统打开</Button>
+          </div>
         </div>
-        <Button icon={<FolderOpenOutlined />} disabled={!listing?.path} onClick={() => listing?.path && window.api.openFile(listing.path)}>系统文件管理器打开</Button>
-      </Toolbar>
 
-      <div className="files-crumbs">
-        {crumbs.root ? <button type="button" onClick={() => load(crumbs.root!.path)}>{crumbs.root.name}</button> : <span>还没有配置保存目录</span>}
-        {crumbs.parts.map((part, index) => {
-          const target = joinPath(crumbs.root?.path || '', crumbs.parts.slice(0, index + 1));
-          const last = index === crumbs.parts.length - 1;
-          return <React.Fragment key={target}><span>/</span>{last ? <strong>{part}</strong> : <button type="button" onClick={() => load(target)}>{part}</button>}</React.Fragment>;
-        })}
-      </div>
+        <div className="files-path-row">
+          <div className="files-crumbs">
+            {crumbs.root ? <button type="button" onClick={() => load(crumbs.root!.path)}>{crumbs.root.name}</button> : <span>还没有配置保存目录</span>}
+            {crumbs.parts.map((part, index) => {
+              const target = joinPath(crumbs.root?.path || '', crumbs.parts.slice(0, index + 1));
+              const last = index === crumbs.parts.length - 1;
+              return <React.Fragment key={target}><span>/</span>{last ? <strong>{part}</strong> : <button type="button" onClick={() => load(target)}>{part}</button>}</React.Fragment>;
+            })}
+          </div>
+          <div className="files-folder-meta">
+            <Badge>{folderCount} 个文件夹</Badge>
+            <Badge>{fileCount} 个文件</Badge>
+            {selectedEntries.length > 0 && <Badge tone="red">已选 {selectedEntries.length}</Badge>}
+          </div>
+        </div>
 
-      {viewMode === 'grid' ? (
-        <div className="am-file-grid" aria-busy={loading}>
-          {!loading && entries.length === 0 ? <div className="ui-empty">{kw ? '当前文件夹没有匹配项' : '这个文件夹是空的'}</div> : entries.map((entry) => (
-            <div key={entry.path} className={`am-file-tile${selectedSet.has(entry.path) ? ' selected' : ''}`} role="button" tabIndex={0} title={entry.name} onClick={(e) => clickEntry(e, entry)} onContextMenu={(e) => showMenu(e, entry)} onKeyDown={(e) => { if (e.key === 'Enter') openEntry(entry); }}>
-              <div className="am-file-tile-icon">{iconFor(entry, true)}</div>
-              <span className="am-file-tile-name">{entry.name}</span>
+        {selectedEntries.length > 0 && (
+          <div className="files-selection-bar">
+            <span>已选中 {selectedEntries.length} 项</span>
+            <Button size="sm" onClick={() => copyEntries(selectedEntries)}>复制到...</Button>
+            <Button size="sm" onClick={() => moveEntries(selectedEntries)}>移动到...</Button>
+            <Button size="sm" variant="danger" onClick={() => setDeleteTargets(selectedEntries)}>删除</Button>
+          </div>
+        )}
+
+        <div className="files-browser-body">
+          {viewMode === 'grid' ? (
+            <div className="am-file-grid" aria-busy={loading}>
+              {!loading && entries.length === 0 ? <div className="ui-empty">{kw ? '当前文件夹没有匹配项' : '这个文件夹是空的'}</div> : entries.map((entry) => (
+                <div key={entry.path} className={`am-file-tile${selectedSet.has(entry.path) ? ' selected' : ''}`} role="button" tabIndex={0} title={entry.name} onClick={(e) => clickEntry(e, entry)} onContextMenu={(e) => showMenu(e, entry)} onKeyDown={(e) => { if (e.key === 'Enter') openEntry(entry); }}>
+                  <div className="am-file-tile-icon">{iconFor(entry, true)}</div>
+                  <span className="am-file-tile-name">{entry.name}</span>
+                  <span className="am-file-tile-meta">{entry.type === 'folder' ? '文件夹' : `${entry.ext ? entry.ext.slice(1).toUpperCase() : '文件'} · ${humanSize(entry.size)}`}</span>
+                </div>
+              ))}
             </div>
-          ))}
+          ) : (
+            <DataTable
+              className="files-table"
+              rows={entries}
+              columns={columns}
+              rowKey={(entry) => entry.path}
+              empty={kw ? '当前文件夹没有匹配项' : '这个文件夹是空的'}
+              rowProps={(entry) => ({
+                className: selectedSet.has(entry.path) ? 'files-row-selected' : undefined,
+                onClick: (e) => clickEntry(e, entry),
+                onContextMenu: (e) => showMenu(e, entry),
+                style: { cursor: 'pointer' },
+              })}
+            />
+          )}
         </div>
-      ) : (
-        <DataTable
-          className="files-table"
-          rows={entries}
-          columns={columns}
-          rowKey={(entry) => entry.path}
-          empty={kw ? '当前文件夹没有匹配项' : '这个文件夹是空的'}
-          rowProps={(entry) => ({
-            className: selectedSet.has(entry.path) ? 'files-row-selected' : undefined,
-            onClick: (e) => clickEntry(e, entry),
-            onContextMenu: (e) => showMenu(e, entry),
-            style: { cursor: 'pointer' },
-          })}
-        />
-      )}
+      </Surface>
 
       {menu && (
         <div className="am-file-menu" style={{ left: menu.x, top: menu.y }} onClick={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { ChevronLeft as LeftOutlined, ChevronRight as RightOutlined, Download as CloudDownloadOutlined, List as UnorderedListOutlined, Search as SearchOutlined } from 'lucide-react';
 import { useTasks } from '../store';
 import type { SearchItem, SearchPagination, SearchTrack, SearchType } from '../types';
@@ -58,7 +58,7 @@ function TraitTags({ traits }: { traits: string[] }) {
 }
 
 export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
-  const { enqueue } = useTasks();
+  const { tasks, enqueue, isDownloaded } = useTasks();
   const [term, setTerm] = useState('');
   const [type, setType] = useState<SearchType>('song');
   const [storefront, setStorefront] = useState('cn');
@@ -126,8 +126,24 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
     }
   };
 
+  // 队列中 / 下载中 / 已暂停的链接集合，用于按钮置灰
+  const activeUrls = useMemo(
+    () => new Set(tasks.filter((t) => t.status === 'queued' || t.status === 'running' || t.status === 'paused').map((t) => t.url)),
+    [tasks]
+  );
+
+  const stateFor = (url: string | undefined, song: boolean): 'queued' | 'downloaded' | 'idle' => {
+    if (!url) return 'idle';
+    if (activeUrls.has(url)) return 'queued';
+    if (isDownloaded(url, mode, song)) return 'downloaded';
+    return 'idle';
+  };
+
   const download = (item: SearchItem) => {
     if (!item.url) return;
+    const st = stateFor(item.url, item.type === 'song');
+    if (st === 'queued') { toast(`「${item.name}」已在队列中，跳过`); return; }
+    if (st === 'downloaded') { toast(`「${item.name}」之前已下载过，跳过`); return; }
     const r = enqueue([{ url: item.url, mode, song: item.type === 'song', debug: false }]);
     if (r.added > 0) notifyAdded(`已加入队列：${item.name}`);
     else toast(`「${item.name}」已在队列中，跳过`);
@@ -135,17 +151,25 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
 
   const downloadTrack = (track: SearchTrack) => {
     if (!track.url) return;
+    const st = stateFor(track.url, true);
+    if (st === 'queued') { toast(`「${track.name}」已在队列中，跳过`); return; }
+    if (st === 'downloaded') { toast(`「${track.name}」之前已下载过，跳过`); return; }
     const r = enqueue([{ url: track.url, mode, song: true, debug: false }]);
     if (r.added > 0) notifyAdded(`已加入队列：${track.name}`);
     else toast(`「${track.name}」已在队列中，跳过`);
   };
 
   const downloadAllTracks = (item: SearchItem) => {
-    const items = (item.tracksDetails || []).filter((t) => t.url && t.supportsDolbyAtmos).map((t) => ({ url: t.url!, mode, song: true, debug: false }));
-    if (items.length === 0) { toast('这张专辑没有可下载的杜比曲目'); return; }
+    const items = (item.tracksDetails || [])
+      .filter((t) => t.url && t.supportsDolbyAtmos && stateFor(t.url, true) === 'idle')
+      .map((t) => ({ url: t.url!, mode, song: true, debug: false }));
+    if (items.length === 0) { toast('可下载的杜比曲目都已在队列或已下载过'); return; }
     const r = enqueue(items);
-    if (r.added > 0) notifyAdded(r.skipped > 0 ? `已加入队列：${r.added} 首曲目（跳过 ${r.skipped} 首重复）` : `已加入队列：${r.added} 首曲目`);
-    else toast('这些曲目都已在队列中');
+    const skipParts: string[] = [];
+    if (r.skipped > 0) skipParts.push(`${r.skipped} 首重复`);
+    if (r.downloaded > 0) skipParts.push(`${r.downloaded} 首已下载过`);
+    if (r.added > 0) notifyAdded(skipParts.length > 0 ? `已加入队列：${r.added} 首曲目（跳过 ${skipParts.join('、')}）` : `已加入队列：${r.added} 首曲目`);
+    else toast('这些曲目都已在队列或已下载过');
   };
 
   return (
@@ -203,7 +227,14 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
                   </span>
                   <small>{item.releaseDate}{item.trackCount ? ` · ${item.trackCount} 首` : ''}{item.durationInMillis ? ` · ${fmtDuration(item.durationInMillis)}` : ''}</small>
                   <div className="search-card-actions">
-                    <Button size="sm" variant="primary" icon={<CloudDownloadOutlined />} onClick={() => download(item)}>下载</Button>
+                    {(() => {
+                      const st = stateFor(item.url, item.type === 'song');
+                      return (
+                        <Button size="sm" variant="primary" icon={<CloudDownloadOutlined />} disabled={st !== 'idle'} onClick={() => download(item)}>
+                          {st === 'downloaded' ? '已下载' : st === 'queued' ? '队列中' : '下载'}
+                        </Button>
+                      );
+                    })()}
                     {item.type === 'album' && (item.tracksDetails?.length ?? 0) > 0 && (
                       <Button size="sm" icon={<UnorderedListOutlined />} onClick={() => setTracksItem(item)}>曲目 ({item.tracksDetails!.length})</Button>
                     )}
@@ -232,7 +263,7 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
             <span><strong>{tracksItem.name}</strong><small>{tracksItem.artistName}</small></span>
           </span>
         )}
-        footer={<><Button onClick={() => setTracksItem(null)}>关闭</Button><Button variant="primary" icon={<CloudDownloadOutlined />} onClick={() => tracksItem && downloadAllTracks(tracksItem)}>下载全部杜比曲目</Button></>}
+        footer={<><Button onClick={() => setTracksItem(null)}>关闭</Button><Button variant="primary" icon={<CloudDownloadOutlined />} disabled={!!tracksItem && !(tracksItem.tracksDetails || []).some((t) => t.url && t.supportsDolbyAtmos && stateFor(t.url, true) === 'idle')} onClick={() => tracksItem && downloadAllTracks(tracksItem)}>下载全部杜比曲目</Button></>}
       >
         <div className="search-track-list">
           {(tracksItem?.tracksDetails || []).map((t, i) => (
@@ -243,7 +274,18 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
                 <small>{t.artistName}{fmtDuration(t.durationInMillis) ? ` · ${fmtDuration(t.durationInMillis)}` : ''}</small>
                 <TraitTags traits={t.audioTraitsTrack} />
               </div>
-              {t.url && <Button size="sm" icon={<CloudDownloadOutlined />} disabled={!t.supportsDolbyAtmos && mode === 'atmos'} onClick={() => downloadTrack(t)} />}
+              {t.url && (() => {
+                const st = stateFor(t.url, true);
+                return (
+                  <Button
+                    size="sm"
+                    icon={<CloudDownloadOutlined />}
+                    disabled={(!t.supportsDolbyAtmos && mode === 'atmos') || st !== 'idle'}
+                    title={st === 'downloaded' ? '已下载过' : st === 'queued' ? '已在队列中' : undefined}
+                    onClick={() => downloadTrack(t)}
+                  />
+                );
+              })()}
             </div>
           ))}
         </div>

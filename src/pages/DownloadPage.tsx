@@ -77,13 +77,19 @@ export default function DownloadPage() {
     if (bad) { showNotice('warning', `链接格式不对: ${bad}`); return; }
 
     const r = enqueue(list.map((url) => ({ url, mode, song, debug })));
-    if (r.added === 0) { showNotice('info', '这些链接都已在队列中'); return; }
+    if (r.added === 0) {
+      showNotice('info', r.downloaded > 0 && r.skipped === 0 ? '这些链接都已下载过，不再重复下载' : '这些链接都已在队列中或已下载过');
+      return;
+    }
 
     setUrls('');
+    const skipParts: string[] = [];
+    if (r.skipped > 0) skipParts.push(`${r.skipped} 个重复`);
+    if (r.downloaded > 0) skipParts.push(`${r.downloaded} 个已下载过`);
     showNotice(
       'success',
-      r.skipped > 0
-        ? `已加入队列：${r.added} 个任务，跳过 ${r.skipped} 个重复（同时最多 ${concurrency} 个）`
+      skipParts.length > 0
+        ? `已加入队列：${r.added} 个任务，跳过 ${skipParts.join('、')}（同时最多 ${concurrency} 个）`
         : `已加入队列：${r.added} 个任务（同时最多 ${concurrency} 个）`
     );
   };

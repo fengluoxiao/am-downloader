@@ -25,11 +25,21 @@ export interface EnqueueItem {
   debug: boolean;
 }
 
+export interface DownloadedItem {
+  url: string;
+  mode: Task['mode'];
+  song: boolean;
+  title: string;
+  finishedAt: number;
+}
+
 interface TaskCtx {
   tasks: Task[];
+  downloadedItems: DownloadedItem[];
   concurrency: number;
   setConcurrency: (n: number) => void;
-  enqueue: (items: EnqueueItem[]) => { added: number; skipped: number };
+  enqueue: (items: EnqueueItem[]) => { added: number; skipped: number; downloaded: number };
+  isDownloaded: (url: string, mode: Task['mode'], song: boolean) => boolean;
   stopTask: (id: string) => void;
   pauseTask: (id: string) => void;
   resumeTask: (id: string) => void;
@@ -42,6 +52,33 @@ export const useTasks = () => useContext(Ctx);
 
 const TASKS_STORAGE_KEY = 'am-download-tasks-v1';
 const CONCURRENCY_STORAGE_KEY = 'am-download-concurrency';
+const DOWNLOADED_STORAGE_KEY = 'am-downloaded-items-v1';
+
+// 已下载记录按「格式 + 链接类型 + URL」去重：同一链接换成别的格式仍可各下一次
+function downloadedKey(mode: Task['mode'], song: boolean, url: string) {
+  return `${mode}|${song ? 'song' : 'link'}|${url}`;
+}
+
+function loadStoredDownloaded(): DownloadedItem[] {
+  try {
+    const raw = localStorage.getItem(DOWNLOADED_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((d) => d && typeof d.url === 'string')
+      .map((d) => ({
+        url: String(d.url),
+        mode: d.mode === 'alac' || d.mode === 'aac' ? d.mode : 'atmos',
+        song: Boolean(d.song),
+        title: String(d.title || ''),
+        finishedAt: Number(d.finishedAt) || 0,
+      }))
+      .slice(0, 1000);
+  } catch {
+    return [];
+  }
+}
 
 export const MODE_LABELS: Record<Task['mode'], string> = {
   atmos: '杜比全景声',
@@ -118,9 +155,25 @@ function loadStoredConcurrency() {
 
 export function TaskProvider({ children }: { children: React.ReactNode }) {
   const [tasks, setTasks] = useState<Task[]>(loadStoredTasks);
+  // 历史里的成功任务也并入已下载记录，即使之后「清除已结束」也不会被重复下载
+  const [downloadedItems, setDownloadedItems] = useState<DownloadedItem[]>(() => {
+    const map = new Map<string, DownloadedItem>();
+    for (const t of loadStoredTasks()) {
+      if (t.status !== 'success') continue;
+      map.set(downloadedKey(t.mode, t.song, t.url), {
+        url: t.url, mode: t.mode, song: t.song, title: t.title, finishedAt: t.endedAt || t.createdAt,
+      });
+    }
+    for (const d of loadStoredDownloaded()) {
+      if (!map.has(downloadedKey(d.mode, d.song, d.url))) map.set(downloadedKey(d.mode, d.song, d.url), d);
+    }
+    return [...map.values()].sort((a, b) => b.finishedAt - a.finishedAt).slice(0, 1000);
+  });
   const [concurrency, setConcurrency] = useState(loadStoredConcurrency);
   const startingRef = useRef<Set<string>>(new Set());
   const cancelledRef = useRef<Set<string>>(new Set());
+  const tasksRef = useRef<Task[]>([]);
+  tasksRef.current = tasks;
 
   // log / exit events keyed by the real process id (assigned when a queued task starts)
   useEffect(() => {
@@ -134,6 +187,15 @@ export function TaskProvider({ children }: { children: React.ReactNode }) {
       );
     });
     const offExit = window.api.onDlExit(({ id, code }) => {
+      const task = tasksRef.current.find((t) => t.id === id);
+      if (task && code === 0 && task.status !== 'stopped') {
+        const key = downloadedKey(task.mode, task.song, task.url);
+        setDownloadedItems((prev) =>
+          prev.some((d) => downloadedKey(d.mode, d.song, d.url) === key)
+            ? prev
+            : [{ url: task.url, mode: task.mode, song: task.song, title: task.title, finishedAt: Date.now() }, ...prev].slice(0, 1000)
+        );
+      }
       setTasks((prev) =>
         prev.map((t) =>
           t.id === id
@@ -157,6 +219,10 @@ export function TaskProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     localStorage.setItem(CONCURRENCY_STORAGE_KEY, String(concurrency));
   }, [concurrency]);
+
+  useEffect(() => {
+    localStorage.setItem(DOWNLOADED_STORAGE_KEY, JSON.stringify(downloadedItems));
+  }, [downloadedItems]);
 
   // scheduler: fill free slots from the queue
   useEffect(() => {
@@ -209,12 +275,16 @@ export function TaskProvider({ children }: { children: React.ReactNode }) {
     const active = new Set(
       tasks.filter((t) => t.status === 'queued' || t.status === 'running' || t.status === 'paused').map((t) => t.url)
     );
+    // 已下载完成的同格式同链接也跳过
+    const completed = new Set(downloadedItems.map((d) => downloadedKey(d.mode, d.song, d.url)));
+    let downloadedSkipped = 0;
     const fresh = items.filter((it) => {
+      if (completed.has(downloadedKey(it.mode, it.song, it.url))) { downloadedSkipped++; return false; }
       if (active.has(it.url)) return false;
       active.add(it.url);
       return true;
     });
-    const skipped = items.length - fresh.length;
+    const skipped = items.length - fresh.length - downloadedSkipped;
     if (fresh.length > 0) {
     setTasks((prev) => [
       ...fresh.map((it, i) => ({
@@ -233,7 +303,12 @@ export function TaskProvider({ children }: { children: React.ReactNode }) {
       ...prev,
     ]);
     }
-    return { added: fresh.length, skipped };
+    return { added: fresh.length, skipped, downloaded: downloadedSkipped };
+  };
+
+  const isDownloaded = (url: string, mode: Task['mode'], song: boolean) => {
+    const key = downloadedKey(mode, song, url);
+    return downloadedItems.some((d) => downloadedKey(d.mode, d.song, d.url) === key);
   };
 
   const stopTask = (id: string) => {
@@ -281,7 +356,7 @@ export function TaskProvider({ children }: { children: React.ReactNode }) {
     setTasks((prev) => prev.filter((t) => t.status === 'running' || t.status === 'queued' || t.status === 'paused'));
 
   return (
-    <Ctx.Provider value={{ tasks, concurrency, setConcurrency, enqueue, stopTask, pauseTask, resumeTask, stopAll, clearFinished }}>
+    <Ctx.Provider value={{ tasks, downloadedItems, concurrency, setConcurrency, enqueue, isDownloaded, stopTask, pauseTask, resumeTask, stopAll, clearFinished }}>
       {children}
     </Ctx.Provider>
   );
