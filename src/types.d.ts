@@ -6,14 +6,17 @@ export interface Status {
   docker: boolean;
   wrapperRunning: boolean;
   wrapperStatusText: string;
-  decryptPort: boolean;
-  m3u8Port: boolean;
+  wrapperApi: boolean;
+  wrapperMode: 'local' | 'remote';
+  wrapperUrl: string;
+  wrapperRegions: string[];
+  wrapperError: string;
   loggedIn: boolean;
   activeAccountId: string;
   activeAccountLabel: string;
   activeStorefront: string;
   accounts: AccountProfile[];
-  mediaUserToken: boolean;
+  stationToken: boolean;
 }
 
 export interface AccountProfile {
@@ -82,6 +85,8 @@ export interface DownloadOpts {
 export type SearchType = 'song' | 'album' | 'compilation' | 'artist';
 
 export interface SearchOpts {
+  requestId?: string;
+  mode?: 'atmos' | 'alac' | 'aac';
   term: string;
   storefront: string;
   type: SearchType;
@@ -127,11 +132,19 @@ export interface SearchPagination {
 }
 
 export interface SearchResponse {
+  requestId?: string;
+  cancelled?: boolean;
   ok?: boolean;
   results?: SearchItem[];
   pagination?: SearchPagination | null;
   error?: string;
   status?: number;
+}
+
+export interface SearchUpdate {
+  requestId: string;
+  item?: SearchItem;
+  progress?: { checked: number; total: number | null };
 }
 
 declare global {
@@ -144,6 +157,7 @@ declare global {
       wrapperStart: () => Promise<{ ok: boolean; error?: string }>;
       wrapperStop: () => Promise<{ ok: boolean; error?: string }>;
       wrapperLogs: () => Promise<{ ok: boolean; logs: string }>;
+      wrapperConfigure: (settings: { mode: 'local' | 'remote'; url: string }) => Promise<{ ok: boolean; connected?: boolean; error?: string }>;
       loginStart: (u: string, p: string) => Promise<{ ok: boolean; error?: string }>;
       login2fa: (code: string) => Promise<{ ok: boolean; error?: string }>;
       loginStop: () => Promise<{ ok: boolean }>;
@@ -160,7 +174,9 @@ declare global {
       downloadPause: (id: string) => Promise<{ ok: boolean; error?: string }>;
       downloadResume: (id: string) => Promise<{ ok: boolean; error?: string }>;
       onDlLog: (cb: (data: { id: string; chunk: string }) => void) => () => void;
-      onDlExit: (cb: (data: { id: string; code: number }) => void) => () => void;
+      onDlExit: (cb: (data: { id: string; code: number; downloaded?: import('./download-history').DownloadedItem[] }) => void) => () => void;
+      reconcileDownloaded: (items: import('./download-history').DownloadedItem[], histories: { url: string; mode: string; song: boolean; log: string }[]) => Promise<import('./download-history').DownloadedItem[]>;
+      onLibraryChanged: (cb: (change: import('./download-history').LibraryChange) => void) => () => void;
       listFiles: () => Promise<AudioFile[]>;
       fileRoots: () => Promise<FileRoot[]>;
       readDir: (p?: string) => Promise<DirectoryListing>;
@@ -181,6 +197,8 @@ declare global {
       pickFolder: (current?: string) => Promise<{ ok: boolean; path?: string }>;
       pickFile: (current?: string) => Promise<{ ok: boolean; path?: string }>;
       search: (opts: SearchOpts) => Promise<SearchResponse>;
+      searchCancel: (requestId: string) => void;
+      onSearchUpdate: (cb: (update: SearchUpdate) => void) => () => void;
     };
   }
 }

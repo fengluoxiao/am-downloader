@@ -13,9 +13,10 @@ interface Props<T extends string> {
   options: Array<SelectOption<T>>;
   onChange: (value: T) => void;
   className?: string;
+  'aria-label'?: string;
 }
 
-export default function Select<T extends string>({ value, options, onChange, className }: Props<T>) {
+export default function Select<T extends string>({ value, options, onChange, className, 'aria-label': ariaLabel }: Props<T>) {
   const [open, setOpen] = useState(false);
   const [menuRect, setMenuRect] = useState({ left: 0, top: 0, width: 0, accent: '' });
   const ref = useRef<HTMLDivElement>(null);
@@ -52,7 +53,7 @@ export default function Select<T extends string>({ value, options, onChange, cla
 
   return (
     <div className={cx('ui-select', open && 'open', className)} ref={ref}>
-      <button type="button" className="ui-select-trigger" aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((next) => !next)}>
+      <button type="button" className="ui-select-trigger" aria-label={ariaLabel} aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((next) => !next)}>
         <span>{selected?.label ?? value}</span>
         <ChevronDown />
       </button>

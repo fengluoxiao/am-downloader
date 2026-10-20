@@ -10,6 +10,7 @@ import Notice from '../ui/Notice';
 import Select from '../ui/Select';
 import Surface from '../ui/Surface';
 import TextInput from '../ui/TextInput';
+import { joinPath, relativeParts } from '../file-path';
 
 function humanSize(n: number | null) {
   if (n == null) return '-';
@@ -19,14 +20,8 @@ function humanSize(n: number | null) {
   return `${n} B`;
 }
 
-function joinPath(base: string, parts: string[]) {
-  return [base.replace(/\/+$/, ''), ...parts].filter(Boolean).join('/');
-}
-
 function pathParts(root: FileRoot | null, current: string) {
-  if (!root || !current.startsWith(root.path)) return [];
-  const rel = current.slice(root.path.length).replace(/^\/+/, '');
-  return rel ? rel.split('/').filter(Boolean) : [];
+  return root ? relativeParts(root.path, current) : [];
 }
 
 export default function FilesPage() {

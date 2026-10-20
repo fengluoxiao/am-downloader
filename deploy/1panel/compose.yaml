@@ -1,0 +1,13 @@
+services:
+  wrapper-lite:
+    image: wrapper-lite:local
+    container_name: wrapper-lite
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "12340:12340"
+    volumes:
+      - /opt/wrapper/rootfs/data:/app/rootfs/data
+    environment:
+      USERNAME: 'your-apple-id'
+      PASSWORD: 'your-password'

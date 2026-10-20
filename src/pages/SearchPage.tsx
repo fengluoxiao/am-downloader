@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft as LeftOutlined, ChevronRight as RightOutlined, Download as CloudDownloadOutlined, List as UnorderedListOutlined, Search as SearchOutlined } from 'lucide-react';
 import { useTasks } from '../store';
-import type { SearchItem, SearchPagination, SearchTrack, SearchType } from '../types';
+import { downloadedKey } from '../download-history';
+import type { SearchItem, SearchPagination, SearchTrack, SearchType, SearchUpdate } from '../types';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import Dialog from '../ui/Dialog';
@@ -73,6 +74,27 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
   const [offsetHistory, setOffsetHistory] = useState<number[]>([0]);
   const [pageIndex, setPageIndex] = useState(0);
   const [tracksItem, setTracksItem] = useState<SearchItem | null>(null);
+  const [searchProgress, setSearchProgress] = useState<SearchUpdate['progress']>(undefined);
+  const activeSearch = useRef<string | null>(null);
+
+  useEffect(() => {
+    const off = window.api.onSearchUpdate((update) => {
+      if (update.requestId !== activeSearch.current) return;
+      if (update.progress) setSearchProgress(update.progress);
+      const item = update.item;
+      if (item) setResults((previous) => {
+        const items = previous || [];
+        const existing = items.findIndex((r) => r.type === item.type && r.id === item.id);
+        if (existing < 0) return [...items, item];
+        return items.map((r, i) => i === existing ? item : r);
+      });
+    });
+    return () => {
+      off();
+      if (activeSearch.current) window.api.searchCancel(activeSearch.current);
+      activeSearch.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -95,25 +117,58 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
     toast(onGoTasks ? `${text}，可去下载管理查看` : text);
   };
 
-  const doSearch = async (offset: number, newHistory?: number[], newIndex?: number) => {
+  const doSearch = async (offset: number, newHistory?: number[], newIndex?: number, searchMode = mode) => {
     if (!term.trim()) { toast('请输入搜索词'); return; }
+    if (activeSearch.current) window.api.searchCancel(activeSearch.current);
+    const requestId = crypto.randomUUID();
+    activeSearch.current = requestId;
     setLoading(true);
     setError(null);
-    const r = await window.api.search({ term: term.trim(), storefront, type, albumFilter, offset });
-    setLoading(false);
-    if (r.error) {
-      setError(r.error);
-      setResults([]);
-      setPagination(null);
-      return;
-    }
-    setResults(r.results || []);
+    setResults(null);
+    setPagination(null);
+    setSearchProgress(undefined);
+    setTracksItem(null);
     setSearchedType(type);
-    setPagination(r.pagination || null);
     if (newHistory && newIndex !== undefined) {
       setOffsetHistory(newHistory);
       setPageIndex(newIndex);
     }
+    try {
+      const r = await window.api.search({ requestId, term: term.trim(), storefront, type, albumFilter, offset, mode: searchMode });
+      if (activeSearch.current !== requestId) return;
+      if (r.error) {
+        setError(r.error);
+        setResults((previous) => previous || []);
+        return;
+      }
+      if (!r.cancelled) {
+        setResults(r.results || []);
+        setPagination(r.pagination || null);
+      }
+    } catch (error) {
+      if (activeSearch.current !== requestId) return;
+      setError(`搜索失败: ${error instanceof Error ? error.message : String(error)}`);
+      setResults((previous) => previous || []);
+    } finally {
+      if (activeSearch.current === requestId) {
+        activeSearch.current = null;
+        setLoading(false);
+      }
+    }
+  };
+
+  const changeMode = (nextMode: typeof mode) => {
+    setMode(nextMode);
+    if ((mode === 'atmos') !== (nextMode === 'atmos') && term.trim() && (results !== null || loading)) {
+      void doSearch(0, [0], 0, nextMode);
+    }
+  };
+
+  const stopSearch = () => {
+    if (activeSearch.current) window.api.searchCancel(activeSearch.current);
+    activeSearch.current = null;
+    setLoading(false);
+    setResults((previous) => previous || []);
   };
 
   const goPage = (dir: 1 | -1) => {
@@ -128,23 +183,40 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
 
   // 队列中 / 下载中 / 已暂停的链接集合，用于按钮置灰
   const activeUrls = useMemo(
-    () => new Set(tasks.filter((t) => t.status === 'queued' || t.status === 'running' || t.status === 'paused').map((t) => t.url)),
+    () => new Set(tasks.filter((t) => t.status === 'queued' || t.status === 'running' || t.status === 'paused').map((t) => downloadedKey(t.mode, t.song, t.url))),
     [tasks]
   );
 
   const stateFor = (url: string | undefined, song: boolean): 'queued' | 'downloaded' | 'idle' => {
     if (!url) return 'idle';
-    if (activeUrls.has(url)) return 'queued';
+    if (activeUrls.has(downloadedKey(mode, song, url))) return 'queued';
     if (isDownloaded(url, mode, song)) return 'downloaded';
     return 'idle';
   };
 
+  const downloadableTracks = (item: SearchItem) => (item.tracksDetails || []).filter((t) => t.url && (mode !== 'atmos' || t.supportsDolbyAtmos));
+  const hasFullTrackList = (item: SearchItem) => !!item.trackCount && item.tracksDetails?.length === item.trackCount;
+  const stateForItem = (item: SearchItem): 'queued' | 'downloaded' | 'idle' => {
+    if (item.type === 'song') return stateFor(item.url, true);
+    const tracks = downloadableTracks(item);
+    if (hasFullTrackList(item) && tracks.length) {
+      if (tracks.every((t) => stateFor(t.url, true) === 'downloaded')) return 'downloaded';
+      if (tracks.every((t) => stateFor(t.url, true) !== 'idle')) return 'queued';
+    }
+    return stateFor(item.url, false);
+  };
+
   const download = (item: SearchItem) => {
     if (!item.url) return;
-    const st = stateFor(item.url, item.type === 'song');
+    const st = stateForItem(item);
     if (st === 'queued') { toast(`「${item.name}」已在队列中，跳过`); return; }
     if (st === 'downloaded') { toast(`「${item.name}」之前已下载过，跳过`); return; }
-    const r = enqueue([{ url: item.url, mode, song: item.type === 'song', debug: false }]);
+    // Queue only missing members when the catalog supplied the full track list.
+    // Recycled tracks remain downloaded and must not be fetched a second time.
+    const tracks = item.type === 'album' && hasFullTrackList(item) ? downloadableTracks(item) : [];
+    const r = enqueue(tracks.length
+      ? tracks.filter((t) => stateFor(t.url, true) === 'idle').map((t) => ({ url: t.url!, mode, song: true, debug: false }))
+      : [{ url: item.url, mode, song: item.type === 'song', debug: false }]);
     if (r.added > 0) notifyAdded(`已加入队列：${item.name}`);
     else toast(`「${item.name}」已在队列中，跳过`);
   };
@@ -160,10 +232,10 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
   };
 
   const downloadAllTracks = (item: SearchItem) => {
-    const items = (item.tracksDetails || [])
-      .filter((t) => t.url && t.supportsDolbyAtmos && stateFor(t.url, true) === 'idle')
+    const items = downloadableTracks(item)
+      .filter((t) => stateFor(t.url, true) === 'idle')
       .map((t) => ({ url: t.url!, mode, song: true, debug: false }));
-    if (items.length === 0) { toast('可下载的杜比曲目都已在队列或已下载过'); return; }
+    if (items.length === 0) { toast('可下载的曲目都已在队列或已下载过'); return; }
     const r = enqueue(items);
     const skipParts: string[] = [];
     if (r.skipped > 0) skipParts.push(`${r.skipped} 首重复`);
@@ -178,7 +250,7 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
         <div className="search-row" style={controlStyle}>
           <div className="search-input-wrap">
             <TextInput
-              placeholder="搜索歌曲 / 专辑 / 合集 / 艺人，仅显示支持杜比全景声的结果"
+              placeholder="搜索歌曲 / 专辑 / 合集 / 艺人"
               value={term}
               onChange={(e) => setTerm(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') doSearch(0, [0], 0); }}
@@ -189,7 +261,7 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
           <Select value={storefront} options={STOREFRONTS} onChange={setStorefront} />
         </div>
         <div className="search-row secondary" style={controlStyle}>
-          {type === 'album' && (
+          {type === 'album' && mode === 'atmos' && (
             <Segmented
               options={[{ label: '专辑优先', value: 'albumPriority' }, { label: '歌名匹配优先', value: 'songPriority' }]}
               value={albumFilter}
@@ -200,20 +272,24 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
           <Segmented
             options={[{ label: '杜比全景声', value: 'atmos' }, { label: 'ALAC 无损', value: 'alac' }, { label: 'AAC', value: 'aac' }]}
             value={mode}
-            onChange={setMode}
+            onChange={changeMode}
           />
-          {pagination && <span className="search-checked">{pagination.total != null ? `已检查 ${pagination.checked} / ${pagination.total} 张` : `已检查 ${pagination.checked} 条`}</span>}
+          {(loading ? searchProgress : pagination) && (() => {
+            const progress = loading ? searchProgress! : pagination!;
+            return <span className="search-checked">{progress.total != null ? `已检查 ${progress.checked} / ${progress.total} 张` : `已检查 ${progress.checked} 条`}</span>;
+          })()}
         </div>
       </Surface>
 
       {notice && <Notice tone="info">{notice}{onGoTasks && notice.includes('已加入队列') && <Button size="sm" variant="quiet" onClick={onGoTasks}>去看任务</Button>}</Notice>}
       {error && <Notice tone="warning">{error}</Notice>}
+      {loading && <Notice tone="info" role="status">{mode === 'atmos' ? '正在筛选杜比全景声' : '正在搜索'}，已找到 {results?.length || 0} 条，结果会陆续显示。 <Button size="sm" variant="quiet" onClick={stopSearch}>{mode === 'atmos' ? '停止筛选' : '停止搜索'}</Button></Notice>}
 
       {loading && results === null ? (
         <div className="search-grid">{Array.from({ length: 8 }).map((_, i) => <div className="search-skeleton" key={i} />)}</div>
       ) : (
         <div className="search-results-wrap" aria-busy={loading}>
-          {results && results.length === 0 && !error && <div className="ui-empty">没有找到支持杜比全景声的结果，换个关键词或区域试试</div>}
+          {!loading && results && results.length === 0 && !error && <div className="ui-empty">{mode === 'atmos' ? '没有找到支持杜比全景声的结果' : '没有找到结果'}，换个关键词或区域试试</div>}
           <div className="search-grid">
             {(results || []).map((item) => (
               <article className="search-card" key={`${item.type}-${item.id}`}>
@@ -228,7 +304,7 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
                   <small>{item.releaseDate}{item.trackCount ? ` · ${item.trackCount} 首` : ''}{item.durationInMillis ? ` · ${fmtDuration(item.durationInMillis)}` : ''}</small>
                   <div className="search-card-actions">
                     {(() => {
-                      const st = stateFor(item.url, item.type === 'song');
+                      const st = stateForItem(item);
                       return (
                         <Button size="sm" variant="primary" icon={<CloudDownloadOutlined />} disabled={st !== 'idle'} onClick={() => download(item)}>
                           {st === 'downloaded' ? '已下载' : st === 'queued' ? '队列中' : '下载'}
@@ -263,7 +339,7 @@ export default function SearchPage({ onGoTasks }: { onGoTasks?: () => void }) {
             <span><strong>{tracksItem.name}</strong><small>{tracksItem.artistName}</small></span>
           </span>
         )}
-        footer={<><Button onClick={() => setTracksItem(null)}>关闭</Button><Button variant="primary" icon={<CloudDownloadOutlined />} disabled={!!tracksItem && !(tracksItem.tracksDetails || []).some((t) => t.url && t.supportsDolbyAtmos && stateFor(t.url, true) === 'idle')} onClick={() => tracksItem && downloadAllTracks(tracksItem)}>下载全部杜比曲目</Button></>}
+        footer={<><Button onClick={() => setTracksItem(null)}>关闭</Button><Button variant="primary" icon={<CloudDownloadOutlined />} disabled={!!tracksItem && !downloadableTracks(tracksItem).some((t) => stateFor(t.url, true) === 'idle')} onClick={() => tracksItem && downloadAllTracks(tracksItem)}>{mode === 'atmos' ? '下载全部杜比曲目' : '下载全部曲目'}</Button></>}
       >
         <div className="search-track-list">
           {(tracksItem?.tracksDetails || []).map((t, i) => (

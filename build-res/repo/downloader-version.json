@@ -1,0 +1,13 @@
+{
+  "source": "https://ghclone.com/WorldObservationLog/apple-music-downloader.git",
+  "revision": "f2573eaf680b5457aed1651c855a37dcb60e1261",
+  "temari": "v0.3.0",
+  "packagingPatch": "Load Temari beside executable; offline --self-test; track IDs in JSON receipts; local media staging and atomic publication with sharing-violation retries",
+  "architecture": "amd64",
+  "hashes": {
+    "libtemari.so": "a178ec0459038a4ff5fba2a33cabf315a71bf42c2eacca2657ee0c73f52e46f7",
+    "temari.dll": "c151f1ac48749b5d549add69eb6a0ebd93fe2fb268ef0375a260f55fc0ff4057",
+    "apple-music-dl": "d6c24923096ad6f21266f44c81258090e79572804fa75fd7fd9dca5574c849af",
+    "apple-music-dl.exe": "4939b463d63b7f57095329c45ddb77c2203074b392d12630671bc7663bbb2c33"
+  }
+}

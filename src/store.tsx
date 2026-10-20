@@ -1,4 +1,7 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import { downloadedKey, mergeDownloaded, relocateDownloaded } from './download-history';
+import type { DownloadedItem, LibraryChange } from './download-history';
+export type { DownloadedItem } from './download-history';
 
 export type TaskStatus = 'queued' | 'running' | 'paused' | 'success' | 'failed' | 'stopped';
 
@@ -25,14 +28,6 @@ export interface EnqueueItem {
   debug: boolean;
 }
 
-export interface DownloadedItem {
-  url: string;
-  mode: Task['mode'];
-  song: boolean;
-  title: string;
-  finishedAt: number;
-}
-
 interface TaskCtx {
   tasks: Task[];
   downloadedItems: DownloadedItem[];
@@ -52,16 +47,11 @@ export const useTasks = () => useContext(Ctx);
 
 const TASKS_STORAGE_KEY = 'am-download-tasks-v1';
 const CONCURRENCY_STORAGE_KEY = 'am-download-concurrency';
-const DOWNLOADED_STORAGE_KEY = 'am-downloaded-items-v1';
-
-// 已下载记录按「格式 + 链接类型 + URL」去重：同一链接换成别的格式仍可各下一次
-function downloadedKey(mode: Task['mode'], song: boolean, url: string) {
-  return `${mode}|${song ? 'song' : 'link'}|${url}`;
-}
+const DOWNLOADED_STORAGE_KEY = 'am-downloaded-items-v2';
 
 function loadStoredDownloaded(): DownloadedItem[] {
   try {
-    const raw = localStorage.getItem(DOWNLOADED_STORAGE_KEY);
+    const raw = localStorage.getItem(DOWNLOADED_STORAGE_KEY) ?? localStorage.getItem('am-downloaded-items-v1');
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -73,8 +63,9 @@ function loadStoredDownloaded(): DownloadedItem[] {
         song: Boolean(d.song),
         title: String(d.title || ''),
         finishedAt: Number(d.finishedAt) || 0,
-      }))
-      .slice(0, 1000);
+        files: Array.isArray(d.files) ? d.files.filter((p: unknown) => typeof p === 'string') : undefined,
+        trackUrls: Array.isArray(d.trackUrls) ? d.trackUrls.filter((p: unknown) => typeof p === 'string') : undefined,
+      }));
   } catch {
     return [];
   }
@@ -155,10 +146,10 @@ function loadStoredConcurrency() {
 
 export function TaskProvider({ children }: { children: React.ReactNode }) {
   const [tasks, setTasks] = useState<Task[]>(loadStoredTasks);
-  // 历史里的成功任务也并入已下载记录，即使之后「清除已结束」也不会被重复下载
+  // 仅首次升级导入旧任务；v2 按文件核对，绝不能在重启后补回已清除的记录。
   const [downloadedItems, setDownloadedItems] = useState<DownloadedItem[]>(() => {
     const map = new Map<string, DownloadedItem>();
-    for (const t of loadStoredTasks()) {
+    for (const t of localStorage.getItem(DOWNLOADED_STORAGE_KEY) === null ? loadStoredTasks() : []) {
       if (t.status !== 'success') continue;
       map.set(downloadedKey(t.mode, t.song, t.url), {
         url: t.url, mode: t.mode, song: t.song, title: t.title, finishedAt: t.endedAt || t.createdAt,
@@ -167,13 +158,41 @@ export function TaskProvider({ children }: { children: React.ReactNode }) {
     for (const d of loadStoredDownloaded()) {
       if (!map.has(downloadedKey(d.mode, d.song, d.url))) map.set(downloadedKey(d.mode, d.song, d.url), d);
     }
-    return [...map.values()].sort((a, b) => b.finishedAt - a.finishedAt).slice(0, 1000);
+    return [...map.values()].sort((a, b) => b.finishedAt - a.finishedAt);
   });
   const [concurrency, setConcurrency] = useState(loadStoredConcurrency);
   const startingRef = useRef<Set<string>>(new Set());
   const cancelledRef = useRef<Set<string>>(new Set());
   const tasksRef = useRef<Task[]>([]);
   tasksRef.current = tasks;
+  const downloadedRef = useRef(downloadedItems);
+  downloadedRef.current = downloadedItems;
+
+  useEffect(() => {
+    let disposed = false;
+    let revision = 0;
+    const refresh = (change: LibraryChange = {}) => {
+      const snapshot = relocateDownloaded(downloadedRef.current, change);
+      downloadedRef.current = snapshot;
+      setDownloadedItems(snapshot);
+      const current = ++revision;
+      void window.api.reconcileDownloaded(snapshot, tasksRef.current).then((checked) => {
+        if (disposed || current !== revision) return;
+        const keys = new Map(checked.map((d) => [downloadedKey(d.mode, d.song, d.url), d]));
+        setDownloadedItems((prev) => prev.flatMap((d) => {
+          // Do not overwrite receipts received while this filesystem check was pending.
+          if (!snapshot.includes(d)) return [d];
+          const kept = keys.get(downloadedKey(d.mode, d.song, d.url));
+          return kept ? [kept] : [];
+        }));
+      }).catch((error) => console.error('核对下载文件失败', error));
+    };
+    const off = window.api.onLibraryChanged(refresh);
+    const onFocus = () => refresh();
+    window.addEventListener('focus', onFocus);
+    refresh();
+    return () => { disposed = true; off(); window.removeEventListener('focus', onFocus); };
+  }, []);
 
   // log / exit events keyed by the real process id (assigned when a queued task starts)
   useEffect(() => {
@@ -186,15 +205,10 @@ export function TaskProvider({ children }: { children: React.ReactNode }) {
         })
       );
     });
-    const offExit = window.api.onDlExit(({ id, code }) => {
+    const offExit = window.api.onDlExit(({ id, code, downloaded = [] }) => {
       const task = tasksRef.current.find((t) => t.id === id);
-      if (task && code === 0 && task.status !== 'stopped') {
-        const key = downloadedKey(task.mode, task.song, task.url);
-        setDownloadedItems((prev) =>
-          prev.some((d) => downloadedKey(d.mode, d.song, d.url) === key)
-            ? prev
-            : [{ url: task.url, mode: task.mode, song: task.song, title: task.title, finishedAt: Date.now() }, ...prev].slice(0, 1000)
-        );
+      if (task && task.status !== 'stopped' && downloaded.length) {
+        setDownloadedItems((prev) => mergeDownloaded(prev, downloaded));
       }
       setTasks((prev) =>
         prev.map((t) =>
@@ -273,15 +287,16 @@ export function TaskProvider({ children }: { children: React.ReactNode }) {
     const now = Date.now();
     // 排队中 / 下载中 / 已暂停的同链接任务视为重复，跳过
     const active = new Set(
-      tasks.filter((t) => t.status === 'queued' || t.status === 'running' || t.status === 'paused').map((t) => t.url)
+      tasks.filter((t) => t.status === 'queued' || t.status === 'running' || t.status === 'paused').map((t) => downloadedKey(t.mode, t.song, t.url))
     );
     // 已下载完成的同格式同链接也跳过
     const completed = new Set(downloadedItems.map((d) => downloadedKey(d.mode, d.song, d.url)));
     let downloadedSkipped = 0;
     const fresh = items.filter((it) => {
       if (completed.has(downloadedKey(it.mode, it.song, it.url))) { downloadedSkipped++; return false; }
-      if (active.has(it.url)) return false;
-      active.add(it.url);
+      const key = downloadedKey(it.mode, it.song, it.url);
+      if (active.has(key)) return false;
+      active.add(key);
       return true;
     });
     const skipped = items.length - fresh.length - downloadedSkipped;

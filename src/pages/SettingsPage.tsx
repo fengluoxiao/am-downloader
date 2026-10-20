@@ -9,49 +9,15 @@ import Surface from '../ui/Surface';
 import Switch from '../ui/Switch';
 import TextArea from '../ui/TextArea';
 import TextInput from '../ui/TextInput';
-
-interface Entry {
-  key: string;
-  value: string;
-  comment: string;
-  line: number;
-}
-
-const KEY_RE = /^([A-Za-z0-9][A-Za-z0-9_-]*):\s*(.*)$/;
-
-function parseEntries(raw: string): Entry[] {
-  const out: Entry[] = [];
-  raw.split('\n').forEach((line, i) => {
-    const m = line.match(KEY_RE);
-    if (!m) return;
-    let rest = m[2];
-    let comment = '';
-    const q = rest.match(/^("[^"]*"|'[^']*')\s*(#.*)?$/);
-    if (q) {
-      rest = q[1];
-      comment = (q[2] || '').replace(/^#\s?/, '');
-    } else {
-      const idx = rest.indexOf(' #');
-      if (idx >= 0) {
-        comment = rest.slice(idx + 2).trim();
-        rest = rest.slice(0, idx);
-      }
-    }
-    out.push({ key: m[1], value: rest.trim(), comment, line: i });
-  });
-  return out;
-}
-
-function unquote(v: string) {
-  const m = v.match(/^"(.*)"$/) || v.match(/^'(.*)'$/);
-  return m ? m[1] : v;
-}
+import { parseEntries, unquote, applyValues } from '../config-form';
+import type { ConfigEntry as Entry } from '../config-form';
 
 const ENUMS: Record<string, { options: string[]; label: string }> = {
   'lrc-type': { options: ['lyrics', 'syllable-lyrics'], label: '歌词类型' },
   'lrc-format': { options: ['lrc', 'ttml'], label: '歌词格式' },
   'cover-format': { options: ['jpg', 'png', 'original'], label: '封面格式' },
   'get-m3u8-mode': { options: ['hires', 'all'], label: 'm3u8 获取模式' },
+  'wrapper-mode': { options: ['local', 'remote'], label: 'wrapper-lite 连接方式' },
   'aac-type': { options: ['aac-lc', 'aac', 'aac-binaural', 'aac-downmix'], label: 'AAC 类型' },
   'atmos-max': { options: ['2768', '2448'], label: '全景声码率上限' },
   'alac-max': { options: ['192000', '96000', '48000', '44100'], label: 'ALAC 采样率上限' },
@@ -59,7 +25,9 @@ const ENUMS: Record<string, { options: string[]; label: string }> = {
 };
 
 const LABELS: Record<string, string> = {
-  'media-user-token': 'media-user-token',
+  'station-token': '电台 token（可选）',
+  'wrapper-lite-url': 'wrapper-lite HTTP 地址',
+  'temari-lib': 'Temari 库路径（留空使用内置库）',
   'authorization-token': 'authorization-token',
   language: '语言',
   'embed-lrc': '内嵌歌词',
@@ -76,9 +44,6 @@ const LABELS: Record<string, string> = {
   'aac-save-folder': 'AAC 保存目录',
   'mv-save-folder': 'MV 保存目录',
   'max-memory-limit': '内存上限 (MB)',
-  'decrypt-m3u8-port': '解密服务地址',
-  'get-m3u8-port': 'm3u8 服务地址',
-  'get-m3u8-from-device': '从设备获取 m3u8',
   'exit-on-error': '出错即退出',
   'limit-max': '单曲时长上限',
   'album-folder-format': '专辑目录命名格式',
@@ -87,26 +52,7 @@ const LABELS: Record<string, string> = {
   ...Object.fromEntries(Object.entries(ENUMS).map(([k, v]) => [k, v.label])),
 };
 
-function applyValues(raw: string, values: Record<string, string>) {
-  const lines = raw.split('\n');
-  for (const [key, val] of Object.entries(values)) {
-    for (let i = 0; i < lines.length; i++) {
-      const m = lines[i].match(KEY_RE);
-      if (m && m[1] === key) {
-        const quoted = /^["'].*["']$/.test(val) || /^(true|false|\d+)$/.test(val) ? val : `"${val.replace(/"/g, '\\"')}"`;
-        lines[i] = lines[i].replace(KEY_RE, (_all, k, rest) => {
-          const idx = String(rest).indexOf(' #');
-          const tail = idx >= 0 ? String(rest).slice(idx) : '';
-          return `${k}: ${quoted}${tail}`;
-        });
-        break;
-      }
-    }
-  }
-  return lines.join('\n');
-}
-
-const SIMPLE_KEYS = new Set(['media-user-token', 'language', 'lrc-type', 'lrc-format', 'embed-lrc', 'save-lrc-file', 'alac-save-folder', 'atmos-save-folder', 'aac-save-folder', 'mv-save-folder', 'alac-max', 'atmos-max']);
+const SIMPLE_KEYS = new Set(['wrapper-mode', 'wrapper-lite-url', 'language', 'lrc-type', 'lrc-format', 'embed-lrc', 'save-lrc-file', 'alac-save-folder', 'atmos-save-folder', 'aac-save-folder', 'mv-save-folder', 'alac-max', 'atmos-max']);
 
 type ViewMode = 'simple' | 'advanced' | 'raw';
 
@@ -148,8 +94,8 @@ export default function SettingsPage() {
     const content = view === 'raw' && rawDraft !== null ? rawDraft : mergedRaw;
     const r = await window.api.writeConfig(content);
     setSaving(false);
-    if (r.ok) { showNotice('success', '配置已保存'); setRaw(content); setValues({}); setRawDraft(null); }
-    else showNotice('error', `YAML 格式错误: ${r.error}`);
+    if (r.ok) { showNotice('success', '配置已保存'); await load(); setRawDraft(null); }
+    else showNotice('error', `保存失败: ${r.error}`);
   };
 
   const unlockRaw = async () => {
@@ -162,8 +108,8 @@ export default function SettingsPage() {
   const renderControl = (e: Entry) => {
     const v = getVal(e);
     if (v === 'true' || v === 'false') return <Switch checked={v === 'true'} onChange={(c) => setVal(e.key, String(c))} />;
-    if (e.key.endsWith('-save-folder')) return <PathPicker value={v} onPick={(next) => setVal(e.key, next)} kind="folder" />;
-    if (e.key === 'ffmpeg-path' || e.key.endsWith('-path')) return <PathPicker value={v} onPick={(next) => setVal(e.key, next)} kind="file" />;
+    if (e.key.endsWith('-save-folder')) return <PathPicker label={LABELS[e.key] || e.key} value={v} onPick={(next) => setVal(e.key, next)} kind="folder" />;
+    if (e.key === 'ffmpeg-path' || e.key.endsWith('-path')) return <PathPicker label={LABELS[e.key] || e.key} value={v} onPick={(next) => setVal(e.key, next)} kind="file" />;
     const en = ENUMS[e.key];
     if (en) return <Select value={v} options={en.options.map((o) => ({ value: o, label: o }))} onChange={(nv) => setVal(e.key, nv)} />;
     return <TextInput value={v} onChange={(ev) => setVal(e.key, ev.target.value)} />;
@@ -186,7 +132,8 @@ export default function SettingsPage() {
         </div>
 
         {notice && <Notice tone={notice.tone} className="settings-notice">{notice.text}</Notice>}
-        <Notice tone="info" className="settings-notice">常用项：storefront 需与账号区域一致（cn/us/jp...）；想要歌词需填入 media-user-token；atmos-max 可选 2768 / 2448。</Notice>
+        <Notice tone="info" className="settings-notice">1Panel 部署选择 remote 并填写 wrapper-lite HTTP 地址；歌词直接使用服务账号。storefront 需与账号区域一致（cn/us/jp...）；atmos-max 可选 2768 / 2448。</Notice>
+        <Notice tone="info" className="settings-notice">保存目录支持本机磁盘、已挂载的 NAS 盘（例如 Y:\music\dolbyatmos）和 UNC 网络共享（例如 \\NAS\music）。可以直接输入路径或点击选择。</Notice>
 
         {view === 'raw' ? (
           <div className="settings-raw">
@@ -224,10 +171,10 @@ export default function SettingsPage() {
   );
 }
 
-function PathPicker({ value, onPick, kind }: { value: string; onPick: (path: string) => void; kind: 'file' | 'folder' }) {
+function PathPicker({ label, value, onPick, kind }: { label: string; value: string; onPick: (path: string) => void; kind: 'file' | 'folder' }) {
   return (
     <div className="settings-path-picker">
-      <TextInput value={value} readOnly placeholder={kind === 'folder' ? '选择保存目录' : '选择可执行文件'} />
+      <TextInput value={value} onChange={(e) => onPick(e.target.value)} aria-label={label} placeholder={kind === 'folder' ? '选择保存目录' : '选择可执行文件'} />
       <Button
         size="sm"
         icon={<FolderOpenOutlined />}

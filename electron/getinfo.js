@@ -5,7 +5,14 @@
 
 // 从 ame-atmos/src/applemusic/services/auth.ts 学习到的 token 提取逻辑
 // 该函数现在接收一个 page 对象作为参数
-async function getAuthTokenFromPage(page) { // page 参数已添加
+async function searchRequest(page, url, options, updates) {
+    updates.signal?.throwIfAborted();
+    const response = await page.request.get(url, options);
+    updates.signal?.throwIfAborted();
+    return response;
+}
+
+async function getAuthTokenFromPage(page, updates) { // page 参数已添加
     console.log("尝试从页面中提取认证 Token (getinfo.js)...");
     try {
         // 确保 page 对象有效
@@ -14,6 +21,7 @@ async function getAuthTokenFromPage(page) { // page 参数已添加
             return null;
         }
         const scriptElement = await page.locator("script[type='module']").first();
+        await scriptElement.waitFor({ state: 'attached', timeout: 10000 });
         // 增加对scriptElement是否存在的检查
         if ((await scriptElement.count()) === 0) {
             console.error("错误: 未能找到 <script type='module'> 元素。");
@@ -28,7 +36,7 @@ async function getAuthTokenFromPage(page) { // page 参数已添加
         console.log(`找到潜在的 JS 文件源: ${scriptSrc}`);
         const fullScriptUrl = scriptSrc.startsWith('http') ? scriptSrc : new URL(scriptSrc, page.url()).toString();
         
-        const response = await page.request.get(fullScriptUrl);
+        const response = await searchRequest(page, fullScriptUrl, {}, updates);
         if (!response.ok()) {
             console.error(`错误: 下载 JS 文件失败，状态码: ${response.status()}`);
             return null;
@@ -52,7 +60,7 @@ async function getAuthTokenFromPage(page) { // page 参数已添加
 
 // 主要的搜索和信息提取函数
 // 该函数现在接收一个 page 对象作为其第一个参数
-async function findAppleMusicInfo(page, searchTerm, storefront = "cn", searchType = "song", albumFilter = "albumPriority", artistOffset = 0) { // page 参数已添加, albumFilter 参数已添加
+async function findAppleMusicInfo(page, searchTerm, storefront = "cn", searchType = "song", albumFilter = "albumPriority", artistOffset = 0, updates = {}) { // updates streams confirmed matches as they are found
     console.log(`[getinfo.js] findAppleMusicInfo CALLED - Term: "${searchTerm}", Store: "${storefront}", Type: "${searchType}", AlbumFilter: "${albumFilter}", ArtistOffset: ${artistOffset}`);
     const searchTermEncoded = encodeURIComponent(searchTerm);
     const searchUrl = `https://music.apple.com/${storefront}/search?term=${searchTermEncoded}`;
@@ -69,16 +77,17 @@ async function findAppleMusicInfo(page, searchTerm, storefront = "cn", searchTyp
         // Navigate to the search page
         // 说明：music.apple.com 是 SPA，页面自身的前端跳转会打断导航（ERR_ABORTED），
         // 且后台请求不断导致 networkidle 可能永不触发。因此改用 domcontentloaded +
-        // 可选的 networkidle 等待，失败时重试一次；ERR_ABORTED 时若页面已有内容则视为成功。
+        // 等待模块脚本即可；Apple Music 的后台请求会让 networkidle 额外拖延搜索。
         let navError = null;
         for (let attempt = 1; attempt <= 2; attempt++) {
             try {
+                updates.signal?.throwIfAborted();
                 console.log(`导航到页面 (getinfo.js): ${searchUrl} (第 ${attempt} 次尝试)`);
                 await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
                 navError = null;
                 break;
             } catch (e) {
+                updates.signal?.throwIfAborted();
                 navError = e;
                 console.error(`导航到 ${searchUrl} 失败 (第 ${attempt} 次, getinfo.js):`, e.message);
                 if (e.message.includes('ERR_ABORTED')) {
@@ -95,18 +104,18 @@ async function findAppleMusicInfo(page, searchTerm, storefront = "cn", searchTyp
             return [{ error: `页面导航失败 (getinfo.js): ${navError.message}. 请检查网络或目标站点状态。`, status: 503 }];
         }
 
-        const authToken = await getAuthTokenFromPage(page); // 传递 page 对象
+        const authToken = await getAuthTokenFromPage(page, updates); // 传递 page 对象
         if (!authToken) {
             return [{ error: "未能获取认证 Token，无法继续调用 AMP API。", status: 500 }];
         }
 
-        // 艺人搜索：直接通过 AMP API 搜索艺人并筛选其支持杜比全景声的专辑
+        // 仅杜比模式筛选音频特性；ALAC/AAC 展示普通目录结果。
         if (searchType === "artist") {
-            return await findArtistAtmosAlbums(page, authToken, searchTerm, storefront, artistOffset);
+            return await findArtistAtmosAlbums(page, authToken, searchTerm, storefront, artistOffset, updates);
         }
 
         // 歌曲/专辑搜索：通过 AMP 搜索 API 分页获取并筛选杜比全景声结果
-        return await searchCatalogPaged(page, authToken, searchTerm, storefront, searchType, albumFilter, artistOffset);
+        return await searchCatalogPaged(page, authToken, searchTerm, storefront, searchType, albumFilter, artistOffset, updates);
 
     } catch (error) {
         console.error(`findAppleMusicInfo 顶层错误 (getinfo.js): ${error.message}`, error.stack);
@@ -130,14 +139,14 @@ module.exports = { findAppleMusicInfo };
 // 分页说明：专辑列表完整拉取后按发行日期倒序排列，每页检查 ARTIST_PAGE_SIZE 张，
 // 通过 offset 参数控制检查窗口，返回 pagination 信息供前端"加载更多"使用
 const ARTIST_PAGE_SIZE = 10;
-async function findArtistAtmosAlbums(page, authToken, searchTerm, storefront, offset = 0) {
+async function findArtistAtmosAlbums(page, authToken, searchTerm, storefront, offset = 0, updates = {}) {
     const headers = { 'Authorization': `Bearer ${authToken}`, 'Origin': 'https://music.apple.com' };
     const searchTermLower = searchTerm.toLowerCase();
 
     // 1. 搜索艺人
     const artistSearchUrl = `https://amp-api.music.apple.com/v1/catalog/${storefront}/search?term=${encodeURIComponent(searchTerm)}&types=artists&limit=10&l=en-US`;
     console.log(`[getinfo.js] ARTIST SEARCH - 请求: ${artistSearchUrl}`);
-    const artistSearchResp = await page.request.get(artistSearchUrl, { headers });
+    const artistSearchResp = await searchRequest(page, artistSearchUrl, { headers }, updates);
     if (!artistSearchResp.ok()) {
         return { error: `艺人搜索 API 请求失败: ${artistSearchResp.status()}`, status: 502 };
     }
@@ -159,7 +168,7 @@ async function findArtistAtmosAlbums(page, authToken, searchTerm, storefront, of
     for (const artist of matchedArtists) {
         const artistAlbumsUrl = `https://amp-api.music.apple.com/v1/catalog/${storefront}/artists/${artist.id}/albums?limit=100&l=en-US`;
         console.log(`[getinfo.js] ARTIST SEARCH - 拉取艺人专辑: ${artist.attributes.name} (${artist.id})`);
-        const albumsResp = await page.request.get(artistAlbumsUrl, { headers });
+        const albumsResp = await searchRequest(page, artistAlbumsUrl, { headers }, updates);
         if (!albumsResp.ok()) {
             console.error(`[getinfo.js] ARTIST SEARCH - 拉取艺人专辑失败: ${albumsResp.status()} (艺人ID: ${artist.id})`);
             continue;
@@ -200,92 +209,100 @@ async function findArtistAtmosAlbums(page, authToken, searchTerm, storefront, of
 
     // 4. 对本页候选专辑逐张获取完整信息（含曲目），确认杜比支持并构建结果
     const results = [];
+    let checked = offset;
+    updates.onProgress?.({ checked, total: totalAlbums });
     for (const candidate of pageCandidates) {
-        let albumResource = candidate;
-        // 需要曲目关系时，重新请求带 extend=tracks 的完整专辑数据
-        const albumDetailUrl = `https://amp-api.music.apple.com/v1/catalog/${storefront}/albums/${candidate.id}?extend=extendedAssetUrls,tracks&l=en-US`;
-        const detailResp = await page.request.get(albumDetailUrl, { headers });
-        if (detailResp.ok()) {
-            const detailJson = await detailResp.json();
-            if (detailJson.data && detailJson.data.length > 0) {
-                albumResource = detailJson.data[0];
-            }
-        } else {
-            console.error(`[getinfo.js] ARTIST SEARCH - 详情请求失败 (${candidate.id}): HTTP ${detailResp.status()} ${(await detailResp.text()).slice(0, 200)}`);
-        }
-
-        const albumAttributes = albumResource.attributes;
-        const albumRelationships = albumResource.relationships;
-        if (!albumAttributes) continue;
-
-        const albumIsActuallyAtmos = albumAttributes.audioTraits?.some(t => ['atmos', 'spatialAudio'].includes(t));
-        if (!albumIsActuallyAtmos) continue;
-
-        // 跳过重复版本（如 clean/explicit 双版本同名专辑）
-        const dupKey = `${albumAttributes.name}|${albumAttributes.releaseDate}|${albumAttributes.trackCount}`;
-        if (results.some(r => `${r.name}|${r.releaseDate}|${r.trackCount}` === dupKey)) continue;
-
-        const tracksDetails = [];
-        if (albumRelationships?.tracks?.data) {
-            for (const track of albumRelationships.tracks.data) {
-                if (!track.attributes) continue;
-                const trackIsAtmos = track.attributes.audioTraits?.some(t => ['atmos', 'spatialAudio', 'losslessSpatial'].includes(t));
-                const trackDetail = {
-                    id: track.id,
-                    name: track.attributes.name,
-                    durationInMillis: track.attributes.durationInMillis,
-                    supportsDolbyAtmos: trackIsAtmos || false,
-                    audioTraitsTrack: track.attributes.audioTraits || [],
-                    releaseDate: track.attributes.releaseDate,
-                    artistName: track.attributes.artistName,
-                    composerName: track.attributes.composerName,
-                    producerName: track.attributes.producerName,
-                    songwriterNames: [],
-                    isrc: track.attributes.isrc,
-                    url: track.attributes.url
-                };
-                if (track.attributes.songwriterNames && Array.isArray(track.attributes.songwriterNames) && track.attributes.songwriterNames.length > 0) {
-                    trackDetail.songwriterNames = track.attributes.songwriterNames.filter(name => name && name.trim() !== '');
-                } else if (track.attributes.writerName && typeof track.attributes.writerName === 'string' && track.attributes.writerName.trim() !== '') {
-                    trackDetail.songwriterNames = track.attributes.writerName.split(/,\s*|\s*;\s*|\s+&\s+|\s+and\s+/i).map(name => name.trim()).filter(name => name !== '');
+        try {
+            updates.signal?.throwIfAborted();
+            let albumResource = candidate;
+            // 需要曲目关系时，重新请求带 extend=tracks 的完整专辑数据
+            const albumDetailUrl = `https://amp-api.music.apple.com/v1/catalog/${storefront}/albums/${candidate.id}?extend=extendedAssetUrls,tracks&l=en-US`;
+            const detailResp = await searchRequest(page, albumDetailUrl, { headers }, updates);
+            if (detailResp.ok()) {
+                const detailJson = await detailResp.json();
+                if (detailJson.data && detailJson.data.length > 0) {
+                    albumResource = detailJson.data[0];
                 }
-                if (!trackDetail.composerName) delete trackDetail.composerName;
-                if (!trackDetail.producerName) delete trackDetail.producerName;
-                if (trackDetail.songwriterNames.length === 0) delete trackDetail.songwriterNames;
-                if (!trackDetail.isrc) delete trackDetail.isrc;
-                tracksDetails.push(trackDetail);
+            } else {
+                console.error(`[getinfo.js] ARTIST SEARCH - 详情请求失败 (${candidate.id}): HTTP ${detailResp.status()} ${(await detailResp.text()).slice(0, 200)}`);
             }
-        }
 
-        const albumItem = {
-            id: albumResource.id,
-            type: 'album',
-            // 区分 单曲/EP、合集与普通专辑，供前端徽标展示
-            albumSubtype: (albumAttributes.isSingle === true || /\s+-\s+(single|ep)$/i.test(albumAttributes.name || ''))
-                ? 'single'
-                : (albumAttributes.isCompilation === true ? 'compilation' : 'album'),
-            name: albumAttributes.name,
-            artistName: albumAttributes.artistName,
-            releaseDate: albumAttributes.releaseDate,
-            artworkUrl: albumAttributes.artwork?.url.replace('{w}', '300').replace('{h}', '300'),
-            supportsDolbyAtmos: true,
-            audioTraits: albumAttributes.audioTraits || [],
-            trackCount: albumAttributes.trackCount,
-            upc: albumAttributes.upc,
-            url: albumAttributes.url,
-            genres: albumAttributes.genreNames || [],
-            tracksDetails,
-            albumFilterApplied: 'artist'
-        };
-        if (!albumItem.upc) delete albumItem.upc;
-        results.push(albumItem);
-        console.log(`[getinfo.js] ARTIST SEARCH - 收录杜比专辑: ${albumItem.name} (${albumItem.id}), 艺人: ${albumItem.artistName}`);
+            const albumAttributes = albumResource.attributes;
+            const albumRelationships = albumResource.relationships;
+            if (!albumAttributes) continue;
+
+            const albumIsActuallyAtmos = albumAttributes.audioTraits?.some(t => ['atmos', 'spatialAudio'].includes(t));
+            if (updates.mode !== 'alac' && updates.mode !== 'aac' && !albumIsActuallyAtmos) continue;
+
+            // 跳过重复版本（如 clean/explicit 双版本同名专辑）
+            const dupKey = `${albumAttributes.name}|${albumAttributes.releaseDate}|${albumAttributes.trackCount}`;
+            if (results.some(r => `${r.name}|${r.releaseDate}|${r.trackCount}` === dupKey)) continue;
+
+            const tracksDetails = [];
+            if (albumRelationships?.tracks?.data) {
+                for (const track of albumRelationships.tracks.data) {
+                    if (!track.attributes) continue;
+                    const trackIsAtmos = track.attributes.audioTraits?.some(t => ['atmos', 'spatialAudio', 'losslessSpatial'].includes(t));
+                    const trackDetail = {
+                        id: track.id,
+                        name: track.attributes.name,
+                        durationInMillis: track.attributes.durationInMillis,
+                        supportsDolbyAtmos: trackIsAtmos || false,
+                        audioTraitsTrack: track.attributes.audioTraits || [],
+                        releaseDate: track.attributes.releaseDate,
+                        artistName: track.attributes.artistName,
+                        composerName: track.attributes.composerName,
+                        producerName: track.attributes.producerName,
+                        songwriterNames: [],
+                        isrc: track.attributes.isrc,
+                        url: track.attributes.url
+                    };
+                    if (track.attributes.songwriterNames && Array.isArray(track.attributes.songwriterNames) && track.attributes.songwriterNames.length > 0) {
+                        trackDetail.songwriterNames = track.attributes.songwriterNames.filter(name => name && name.trim() !== '');
+                    } else if (track.attributes.writerName && typeof track.attributes.writerName === 'string' && track.attributes.writerName.trim() !== '') {
+                        trackDetail.songwriterNames = track.attributes.writerName.split(/,\s*|\s*;\s*|\s+&\s+|\s+and\s+/i).map(name => name.trim()).filter(name => name !== '');
+                    }
+                    if (!trackDetail.composerName) delete trackDetail.composerName;
+                    if (!trackDetail.producerName) delete trackDetail.producerName;
+                    if (trackDetail.songwriterNames.length === 0) delete trackDetail.songwriterNames;
+                    if (!trackDetail.isrc) delete trackDetail.isrc;
+                    tracksDetails.push(trackDetail);
+                }
+            }
+
+            const albumItem = {
+                id: albumResource.id,
+                type: 'album',
+                // 区分 单曲/EP、合集与普通专辑，供前端徽标展示
+                albumSubtype: (albumAttributes.isSingle === true || /\s+-\s+(single|ep)$/i.test(albumAttributes.name || ''))
+                    ? 'single'
+                    : (albumAttributes.isCompilation === true ? 'compilation' : 'album'),
+                name: albumAttributes.name,
+                artistName: albumAttributes.artistName,
+                releaseDate: albumAttributes.releaseDate,
+                artworkUrl: albumAttributes.artwork?.url.replace('{w}', '300').replace('{h}', '300'),
+                supportsDolbyAtmos: Boolean(albumIsActuallyAtmos),
+                audioTraits: albumAttributes.audioTraits || [],
+                trackCount: albumAttributes.trackCount,
+                upc: albumAttributes.upc,
+                url: albumAttributes.url,
+                genres: albumAttributes.genreNames || [],
+                tracksDetails,
+                albumFilterApplied: 'artist'
+            };
+            if (!albumItem.upc) delete albumItem.upc;
+            results.push(albumItem);
+            updates.onResult?.(albumItem);
+            console.log(`[getinfo.js] ARTIST SEARCH - 收录专辑: ${albumItem.name} (${albumItem.id}), 艺人: ${albumItem.artistName}`);
+        } finally {
+            updates.onProgress?.({ checked: ++checked, total: totalAlbums });
+        }
     }
 
     if (results.length === 0) {
-        console.log('[getinfo.js] ARTIST SEARCH - 本页未找到杜比全景声专辑。');
+        console.log('[getinfo.js] ARTIST SEARCH - 本页未找到符合条件的专辑。');
     } else {
-        console.log(`[getinfo.js] ARTIST SEARCH - 本页收录 ${results.length} 张杜比全景声专辑。`);
+        console.log(`[getinfo.js] ARTIST SEARCH - 本页收录 ${results.length} 张专辑。`);
     }
     return { results, pagination };
 }
@@ -297,7 +314,7 @@ async function findArtistAtmosAlbums(page, authToken, searchTerm, storefront, of
 const SEARCH_PAGE_SIZE = 10;
 const MAX_SCAN_PAGES = 3; // 单次请求最多向后扫描的原始页数（专辑/合集每页需逐张拉详情，不宜过多）
 const COMPILATION_MAX_SCAN_PAGES = 6; // 合集有免详情预筛，扫描成本低，可以扫得更深
-async function searchCatalogPaged(page, authToken, searchTerm, storefront, searchType, albumFilter, offset = 0) {
+async function searchCatalogPaged(page, authToken, searchTerm, storefront, searchType, albumFilter, offset = 0, updates = {}) {
     const headers = { 'Authorization': `Bearer ${authToken}`, 'Origin': 'https://music.apple.com' };
     const isAlbumKind = searchType === 'album' || searchType === 'compilation';
     const types = isAlbumKind ? 'albums' : 'songs';
@@ -315,7 +332,7 @@ async function searchCatalogPaged(page, authToken, searchTerm, storefront, searc
 
     for (let scanned = 1; scanned <= maxScanPages; scanned++) {
         console.log(`[getinfo.js] ${searchType.toUpperCase()} SEARCH - 请求: ${searchUrlFor(scanOffset, SEARCH_PAGE_SIZE)}`);
-        const resp = await page.request.get(searchUrlFor(scanOffset, SEARCH_PAGE_SIZE), { headers });
+        const resp = await searchRequest(page, searchUrlFor(scanOffset, SEARCH_PAGE_SIZE), { headers }, updates);
         if (!resp.ok()) {
             if (scanned === 1) return { error: `搜索 API 请求失败: ${resp.status()}`, status: 502 };
             console.error(`[getinfo.js] ${searchType.toUpperCase()} SEARCH - 后续页请求失败: ${resp.status()}，按没有更多处理`);
@@ -333,7 +350,7 @@ async function searchCatalogPaged(page, authToken, searchTerm, storefront, searc
         let songHasMore = false;
         if (searchType === 'compilation') {
             try {
-                const songResp = await page.request.get(searchUrlFor(scanOffset, SONG_SCAN_LIMIT, 'songs'), { headers });
+                const songResp = await searchRequest(page, searchUrlFor(scanOffset, SONG_SCAN_LIMIT, 'songs'), { headers }, updates);
                 if (songResp.ok()) {
                     const songJson = await songResp.json();
                     const songGroup = songJson.results?.songs;
@@ -376,9 +393,13 @@ async function searchCatalogPaged(page, authToken, searchTerm, storefront, searc
         if (candidates.length > 0) {
             if (isAlbumKind) {
                 const filterMode = searchType === 'compilation' ? 'compilation' : albumFilter;
-                results = await buildAlbumResults(page, headers, storefront, candidates, searchTermLower, filterMode);
+                results = await buildAlbumResults(page, headers, storefront, candidates, searchTermLower, filterMode, {
+                    ...updates,
+                    onProgress: ({ checked }) => updates.onProgress?.({ checked: scanOffset + Math.min(checked, rawCount), total: null }),
+                });
             } else {
-                results = buildSongResults(items);
+                results = buildSongResults(items, updates);
+                updates.onProgress?.({ checked: scanOffset + rawCount, total: null });
             }
         } else {
             results = [];
@@ -390,7 +411,7 @@ async function searchCatalogPaged(page, authToken, searchTerm, storefront, searc
             // 即将返回：若 hasMore 依赖满页 next，探测下一页确认不是空页，避免幽灵分页
             if (rawHasMore) {
                 try {
-                    const probeResp = await page.request.get(searchUrlFor(scanOffset + SEARCH_PAGE_SIZE, 1), { headers });
+                    const probeResp = await searchRequest(page, searchUrlFor(scanOffset + SEARCH_PAGE_SIZE, 1), { headers }, updates);
                     if (probeResp.ok()) {
                         const probeJson = await probeResp.json();
                         rawHasMore = (probeJson.results?.[types]?.data || []).length > 0;
@@ -415,13 +436,14 @@ async function searchCatalogPaged(page, authToken, searchTerm, storefront, searc
     };
     console.log(`[getinfo.js] ${searchType.toUpperCase()} SEARCH - 返回: 收录 ${results.length} 条, pagination: ${JSON.stringify(pagination)}`);
     if (results.length === 0 && !hasMore && offset === 0) {
-        return { error: `未能找到支持杜比全景声的${typeLabel}。请尝试其他搜索词或类型。`, status: 404 };
+        const qualifier = updates.mode === 'alac' || updates.mode === 'aac' ? '' : '支持杜比全景声的';
+        return { error: `未能找到${qualifier}${typeLabel}。请尝试其他搜索词或类型。`, status: 404 };
     }
     return { results, pagination };
 }
 
 // 从搜索结果中筛选支持杜比全景声的歌曲并构建结果项
-function buildSongResults(songResources) {
+function buildSongResults(songResources, updates = {}) {
     const results = [];
     const seenIds = new Set();
     for (const song of songResources) {
@@ -429,7 +451,7 @@ function buildSongResults(songResources) {
         if (!attrs || seenIds.has(song.id)) continue;
         seenIds.add(song.id);
         const isAtmos = attrs.audioTraits?.some(t => ['atmos', 'spatialAudio', 'losslessSpatial'].includes(t));
-        if (!isAtmos) continue;
+        if (updates.mode !== 'alac' && updates.mode !== 'aac' && !isAtmos) continue;
         // 歌曲URL形如 /album/{slug}/{albumId}?i={songId}，从中提取专辑ID
         const albumIdMatch = attrs.url ? attrs.url.match(/\/album\/[^/]+\/(\d+)/) : null;
         let songwriters = [];
@@ -445,7 +467,7 @@ function buildSongResults(songResources) {
             artistName: attrs.artistName,
             releaseDate: attrs.releaseDate,
             artworkUrl: attrs.artwork?.url.replace('{w}', '300').replace('{h}', '300'),
-            supportsDolbyAtmos: true,
+            supportsDolbyAtmos: Boolean(isAtmos),
             audioTraits: attrs.audioTraits || [],
             genres: attrs.genreNames || [],
             durationInMillis: attrs.durationInMillis,
@@ -461,6 +483,7 @@ function buildSongResults(songResources) {
         if (!item.songwriterNames) delete item.songwriterNames;
         if (!item.isrc) delete item.isrc;
         results.push(item);
+        updates.onResult?.(item);
     }
     return results;
 }
@@ -495,87 +518,98 @@ function buildTrackDetail(track) {
 }
 
 // 对搜索结果中的专辑逐张获取完整信息（含曲目），按专辑筛选规则构建结果
-async function buildAlbumResults(page, headers, storefront, albumResources, searchTermLower, albumFilter) {
+async function buildAlbumResults(page, headers, storefront, albumResources, searchTermLower, albumFilter, updates = {}) {
     const results = [];
+    const atmosOnly = updates.mode !== 'alac' && updates.mode !== 'aac';
     const seenIds = new Set();
+    let checked = 0;
     for (const candidate of albumResources) {
-        if (seenIds.has(candidate.id)) continue;
-        seenIds.add(candidate.id);
+        try {
+            updates.signal?.throwIfAborted();
+            if (seenIds.has(candidate.id)) continue;
+            seenIds.add(candidate.id);
 
-        let albumResource = candidate;
-        const detailUrl = `https://amp-api.music.apple.com/v1/catalog/${storefront}/albums/${candidate.id}?extend=extendedAssetUrls,tracks&l=en-US`;
-        const detailResp = await page.request.get(detailUrl, { headers });
-        if (detailResp.ok()) {
-            const detailJson = await detailResp.json();
-            if (detailJson.data && detailJson.data.length > 0) albumResource = detailJson.data[0];
-        } else {
-            console.error(`[getinfo.js] ALBUM SEARCH - 详情请求失败 (${candidate.id}): HTTP ${detailResp.status()}`);
-        }
+            let albumResource = candidate;
+            const detailUrl = `https://amp-api.music.apple.com/v1/catalog/${storefront}/albums/${candidate.id}?extend=extendedAssetUrls,tracks&l=en-US`;
+            const detailResp = await searchRequest(page, detailUrl, { headers }, updates);
+            if (detailResp.ok()) {
+                const detailJson = await detailResp.json();
+                if (detailJson.data && detailJson.data.length > 0) albumResource = detailJson.data[0];
+            } else {
+                console.error(`[getinfo.js] ALBUM SEARCH - 详情请求失败 (${candidate.id}): HTTP ${detailResp.status()}`);
+            }
 
-        const albumAttributes = albumResource.attributes;
-        const albumRelationships = albumResource.relationships;
-        if (!albumAttributes) continue;
+            const albumAttributes = albumResource.attributes;
+            const albumRelationships = albumResource.relationships;
+            if (!albumAttributes) continue;
 
-        const albumIsActuallyAtmos = albumAttributes.audioTraits?.some(t => ['atmos', 'spatialAudio'].includes(t));
-        // 合集判定：API 的 isCompilation 字段，或艺人为 Various Artists
-        const isCompilationRelease = albumAttributes.isCompilation === true || albumAttributes.artistName === 'Various Artists';
-        if (albumFilter === 'compilation' && !isCompilationRelease) continue;
+            const albumIsActuallyAtmos = albumAttributes.audioTraits?.some(t => ['atmos', 'spatialAudio'].includes(t));
+            // 合集判定：API 的 isCompilation 字段，或艺人为 Various Artists
+            const isCompilationRelease = albumAttributes.isCompilation === true || albumAttributes.artistName === 'Various Artists';
+            if (albumFilter === 'compilation' && !isCompilationRelease) continue;
 
-        const tracksDetails = [];
-        let foundRelevantAtmosTrack = false;
-        if (albumRelationships?.tracks?.data) {
-            for (const track of albumRelationships.tracks.data) {
-                if (!track.attributes) continue;
-                const trackIsAtmos = track.attributes.audioTraits?.some(t => ['atmos', 'spatialAudio', 'losslessSpatial'].includes(t));
-                const trackNameMatchesSearch = track.attributes.name.toLowerCase().includes(searchTermLower);
-                if (albumFilter === 'compilation') {
-                    // 合集模式收录全部曲目，不做曲目名匹配
-                    tracksDetails.push(buildTrackDetail(track));
-                } else if (albumFilter === 'songPriority') {
-                    if (trackNameMatchesSearch && trackIsAtmos) {
+            const tracksDetails = [];
+            let foundRelevantAtmosTrack = false;
+            if (albumRelationships?.tracks?.data) {
+                for (const track of albumRelationships.tracks.data) {
+                    if (!track.attributes) continue;
+                    const trackIsAtmos = track.attributes.audioTraits?.some(t => ['atmos', 'spatialAudio', 'losslessSpatial'].includes(t));
+                    const trackNameMatchesSearch = track.attributes.name.toLowerCase().includes(searchTermLower);
+                    if (!atmosOnly || albumFilter === 'compilation') {
+                        // 合集模式收录全部曲目，不做曲目名匹配
                         tracksDetails.push(buildTrackDetail(track));
-                        foundRelevantAtmosTrack = true;
+                    } else if (albumFilter === 'songPriority') {
+                        if (trackNameMatchesSearch && trackIsAtmos) {
+                            tracksDetails.push(buildTrackDetail(track));
+                            foundRelevantAtmosTrack = true;
+                        }
+                    } else {
+                        tracksDetails.push(buildTrackDetail(track));
+                        if (trackNameMatchesSearch && trackIsAtmos) foundRelevantAtmosTrack = true;
                     }
-                } else {
-                    tracksDetails.push(buildTrackDetail(track));
-                    if (trackNameMatchesSearch && trackIsAtmos) foundRelevantAtmosTrack = true;
                 }
             }
-        }
 
-        let shouldCollect = false;
-        if (albumFilter === 'compilation') {
-            // 合集模式：专辑本身支持杜比即收录（搜索词由搜索 API 按专辑名匹配）
-            shouldCollect = albumIsActuallyAtmos;
-        } else if (albumFilter === 'songPriority') {
-            shouldCollect = foundRelevantAtmosTrack && tracksDetails.length > 0;
-        } else {
-            shouldCollect = albumIsActuallyAtmos && foundRelevantAtmosTrack;
-        }
-        if (!shouldCollect) continue;
+            let shouldCollect = false;
+            if (!atmosOnly) {
+                // 搜索 API 已匹配关键词；普通模式保留全部曲目和非杜比专辑。
+                shouldCollect = true;
+            } else if (albumFilter === 'compilation') {
+                // 合集模式：专辑本身支持杜比即收录（搜索词由搜索 API 按专辑名匹配）
+                shouldCollect = albumIsActuallyAtmos;
+            } else if (albumFilter === 'songPriority') {
+                shouldCollect = foundRelevantAtmosTrack && tracksDetails.length > 0;
+            } else {
+                shouldCollect = albumIsActuallyAtmos && foundRelevantAtmosTrack;
+            }
+            if (!shouldCollect) continue;
 
-        const albumItem = {
-            id: albumResource.id,
-            type: 'album',
-            albumSubtype: (albumAttributes.isSingle === true || /\s+-\s+(single|ep)$/i.test(albumAttributes.name || ''))
-                ? 'single'
-                : (isCompilationRelease ? 'compilation' : 'album'),
-            name: albumAttributes.name,
-            artistName: albumAttributes.artistName,
-            releaseDate: albumAttributes.releaseDate,
-            artworkUrl: albumAttributes.artwork?.url.replace('{w}', '300').replace('{h}', '300'),
-            supportsDolbyAtmos: albumIsActuallyAtmos,
-            audioTraits: albumAttributes.audioTraits || [],
-            trackCount: albumAttributes.trackCount,
-            upc: albumAttributes.upc,
-            url: albumAttributes.url,
-            genres: albumAttributes.genreNames || [],
-            tracksDetails,
-            albumFilterApplied: albumFilter
-        };
-        if (!albumItem.upc) delete albumItem.upc;
-        results.push(albumItem);
-        console.log(`[getinfo.js] ALBUM SEARCH - 收录专辑: ${albumItem.name} (${albumItem.id}), 筛选: ${albumFilter}`);
+            const albumItem = {
+                id: albumResource.id,
+                type: 'album',
+                albumSubtype: (albumAttributes.isSingle === true || /\s+-\s+(single|ep)$/i.test(albumAttributes.name || ''))
+                    ? 'single'
+                    : (isCompilationRelease ? 'compilation' : 'album'),
+                name: albumAttributes.name,
+                artistName: albumAttributes.artistName,
+                releaseDate: albumAttributes.releaseDate,
+                artworkUrl: albumAttributes.artwork?.url.replace('{w}', '300').replace('{h}', '300'),
+                supportsDolbyAtmos: Boolean(albumIsActuallyAtmos),
+                audioTraits: albumAttributes.audioTraits || [],
+                trackCount: albumAttributes.trackCount,
+                upc: albumAttributes.upc,
+                url: albumAttributes.url,
+                genres: albumAttributes.genreNames || [],
+                tracksDetails,
+                albumFilterApplied: albumFilter
+            };
+            if (!albumItem.upc) delete albumItem.upc;
+            results.push(albumItem);
+            updates.onResult?.(albumItem);
+            console.log(`[getinfo.js] ALBUM SEARCH - 收录专辑: ${albumItem.name} (${albumItem.id}), 筛选: ${albumFilter}`);
+        } finally {
+            updates.onProgress?.({ checked: ++checked, total: null });
+        }
     }
     return results;
 }

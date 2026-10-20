@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('api', {
   wrapperStart: () => ipcRenderer.invoke('wrapper:start'),
   wrapperStop: () => ipcRenderer.invoke('wrapper:stop'),
   wrapperLogs: () => ipcRenderer.invoke('wrapper:logs'),
+  wrapperConfigure: (settings) => ipcRenderer.invoke('wrapper:configure', settings),
 
   loginStart: (username, password) => ipcRenderer.invoke('login:start', { username, password }),
   login2fa: (code) => ipcRenderer.invoke('login:2fa', code),
@@ -55,6 +56,12 @@ contextBridge.exposeInMainWorld('api', {
   downloadStop: (id) => ipcRenderer.invoke('download:stop', id),
   downloadPause: (id) => ipcRenderer.invoke('download:pause', id),
   downloadResume: (id) => ipcRenderer.invoke('download:resume', id),
+  reconcileDownloaded: (items, histories) => ipcRenderer.invoke('download:reconcile', items, histories),
+  onLibraryChanged: (cb) => {
+    const fn = (_e, data) => cb(data);
+    ipcRenderer.on('library-changed', fn);
+    return () => ipcRenderer.removeListener('library-changed', fn);
+  },
   onDlLog: (cb) => {
     const fn = (_e, data) => cb(data);
     ipcRenderer.on('dl-log', fn);
@@ -89,4 +96,10 @@ contextBridge.exposeInMainWorld('api', {
   pickFile: (current) => ipcRenderer.invoke('dialog:pickFile', current),
 
   search: (opts) => ipcRenderer.invoke('search:run', opts),
+  searchCancel: (requestId) => ipcRenderer.send('search:cancel', requestId),
+  onSearchUpdate: (cb) => {
+    const fn = (_e, data) => cb(data);
+    ipcRenderer.on('search:update', fn);
+    return () => ipcRenderer.removeListener('search:update', fn);
+  },
 });

@@ -32,6 +32,10 @@ function Check({ ok, label }: { ok: boolean; label: string }) {
 
 export default function ServicePage() {
   const [status, setStatus] = useState<Status | null>(null);
+  const [connectionMode, setConnectionMode] = useState<'local' | 'remote'>('local');
+  const [connectionUrl, setConnectionUrl] = useState('http://127.0.0.1:12340');
+  const [connectionDirty, setConnectionDirty] = useState(false);
+  const [savingConnection, setSavingConnection] = useState(false);
   const [busy, setBusy] = useState(false);
   const [switchingAccount, setSwitchingAccount] = useState(false);
   const [logs, setLogs] = useState('');
@@ -67,6 +71,24 @@ export default function ServicePage() {
   }, [refresh, showNotice]);
 
   useEffect(() => {
+    if (status && !connectionDirty) {
+      setConnectionMode(status.wrapperMode);
+      setConnectionUrl(status.wrapperUrl);
+    }
+  }, [status, connectionDirty]);
+
+  const saveConnection = async () => {
+    setSavingConnection(true);
+    try {
+      const r = await window.api.wrapperConfigure({ mode: connectionMode, url: connectionUrl.trim() });
+      if (!r.ok) { showNotice('error', r.error || '保存失败'); return; }
+      setConnectionDirty(false);
+      showNotice(r.connected ? 'success' : 'warning', r.connected ? '连接已保存，wrapper-lite 接口正常' : `连接已保存；${r.error}`);
+      await refresh();
+    } finally { setSavingConnection(false); }
+  };
+
+  useEffect(() => {
     refresh();
     const timer = setInterval(refresh, 5000);
     const offLog = window.api.onLoginLog((c) => setLoginLog((p) => (p + c).slice(-100000)));
@@ -75,7 +97,7 @@ export default function ServicePage() {
     const offFail = window.api.onLoginFailed(() => {
       setNeed2fa(false);
       setLogging(false);
-      showNotice('error', '登录被 Apple 拒绝：请检查邮箱和密码、密码不含英文冒号；若账号被锁或没同意过 iTunes 条款，请先在 music.apple.com 网页登录一次');
+      showNotice('error', '登录未完成，请查看登录日志；如 Apple 拒绝登录，请检查账号密码，或先在 music.apple.com 同意账号条款');
     });
     const offOk = window.api.onLoginSuccess(async () => {
       setNeed2fa(false);
@@ -160,14 +182,33 @@ export default function ServicePage() {
   const s = status;
   const readyCount = useMemo(() => {
     if (!s) return 0;
-    return [s.downloader, s.mp4box, s.decryptPort, s.m3u8Port].filter(Boolean).length;
+    return [s.downloader, s.mp4box, s.wrapperApi].filter(Boolean).length;
   }, [s]);
   const showLoginForm = Boolean(s && !s.loggedIn) || showCredentialLogin || logging || need2fa;
-  const serviceReady = Boolean(s?.wrapperRunning && s?.loggedIn && s?.decryptPort && s?.m3u8Port);
+  const remote = s?.wrapperMode === 'remote';
+  const serviceReady = Boolean(s?.wrapperApi && s?.loggedIn);
 
   return (
     <div className="service-page">
       {notice && <Notice tone={notice.tone}>{notice.text}</Notice>}
+
+      <Surface>
+        <div className="ui-section-head compact">
+          <div><h2>wrapper-lite 连接</h2><p>使用 1Panel 部署时选择远程服务，填写服务器的 HTTP 地址。</p></div>
+        </div>
+        <div className="service-login-row">
+          <Select aria-label="连接方式" value={connectionMode} options={[{ value: 'local', label: '本机 Docker' }, { value: 'remote', label: '远程服务 / 1Panel' }]} onChange={(value) => {
+            setConnectionMode(value as 'local' | 'remote');
+            if (value === 'local') setConnectionUrl('http://127.0.0.1:12340');
+            setConnectionDirty(true);
+          }} />
+          <TextInput aria-label="wrapper-lite 地址" placeholder="http://服务器IP:12340" value={connectionUrl} onChange={(e) => { setConnectionUrl(e.target.value); setConnectionDirty(true); }} />
+          <Button variant="primary" disabled={savingConnection || logging || busy} onClick={saveConnection}>保存并检查连接</Button>
+        </div>
+        {remote && <Notice tone="info" className="service-inline-notice">Apple ID 登录、验证码和容器启停在 1Panel 中完成。下载文件保存到当前电脑。</Notice>}
+        {s?.wrapperError && <Notice tone="warning" className="service-inline-notice">{s.wrapperError}</Notice>}
+        {s?.wrapperApi && !s.loggedIn && <Notice tone="warning" className="service-inline-notice">服务已连接，尚未返回账号区域，请先完成 Apple ID 登录。</Notice>}
+      </Surface>
 
       <Surface className="service-hero">
         <div className="service-hero-main">
@@ -177,11 +218,11 @@ export default function ServicePage() {
           <div className="service-hero-copy">
             <span className="service-hero-kicker">解密服务</span>
             <h2>{serviceReady ? '服务已就绪' : s?.wrapperRunning ? '服务正在运行' : '服务未启动'}</h2>
-            <p>{serviceReady ? `${s?.activeAccountLabel || '当前账号'}、wrapper 和端口都正常，可以开始下载杜比全景声。` : '下载杜比全景声前，需要选择账号、完成 Apple ID 登录并保持 wrapper 运行。'}</p>
+            <p>{serviceReady ? `wrapper-lite 已就绪，账号区域：${s?.wrapperRegions.join(' / ') || s?.activeStorefront}。` : remote ? '请在 1Panel 启动 wrapper-lite 并完成 Apple ID 登录，再检查连接。' : '下载前需要选择账号、完成 Apple ID 登录并保持 wrapper-lite 运行。'}</p>
           </div>
         </div>
         <div className="service-command-stack">
-          <div className="service-account-switcher">
+          {!remote && <div className="service-account-switcher">
             <span>当前账号</span>
             <Select
               className="service-account-select"
@@ -195,13 +236,13 @@ export default function ServicePage() {
               onChange={switchAccount}
             />
             <Button size="sm" icon={<Plus />} onClick={() => setAccountDialogOpen(true)}>管理</Button>
-          </div>
+          </div>}
           {s && <Badge tone={s.wrapperRunning ? 'red' : 'default'}>{switchingAccount ? '切换中' : s.wrapperRunning ? '运行中' : '未运行'}</Badge>}
           <div className="service-actions">
             <Button size="sm" icon={<ReloadOutlined />} onClick={refresh}>刷新状态</Button>
-            {s?.wrapperRunning
+            {!remote && (s?.wrapperRunning
               ? <Button size="sm" variant="danger" disabled={busy || switchingAccount} onClick={stopWrapper}>停止服务</Button>
-              : <Button size="sm" variant="primary" disabled={busy || switchingAccount || !s?.loggedIn} onClick={startWrapper}>启动服务</Button>}
+              : <Button size="sm" variant="primary" disabled={busy || switchingAccount || logging || !s?.loggedIn} onClick={startWrapper}>启动服务</Button>)}
           </div>
         </div>
       </Surface>
@@ -209,18 +250,18 @@ export default function ServicePage() {
       <div className="service-overview-grid">
         <Surface className="service-account-card">
           <div className="service-card-title"><ShieldCheck /><span>Apple ID</span></div>
-          <strong>{s?.activeAccountLabel || '国区账号'}</strong>
-          <p>{s?.loggedIn ? '当前账号已登录，可启动 wrapper。' : '当前账号未登录，需要先输入 Apple ID。'}</p>
+          <strong>{remote ? '1Panel 服务器账号' : s?.activeAccountLabel || '当前账号'}</strong>
+          <p>{s?.loggedIn ? '当前账号已登录。' : remote ? '请在 1Panel 完成登录。' : '当前账号未登录，需要先输入 Apple ID。'}</p>
         </Surface>
         <Surface className="service-account-card">
-          <div className="service-card-title"><KeyRound /><span>media-user-token</span></div>
-          <strong>{s?.mediaUserToken ? '已配置' : '可选'}</strong>
-          <p>用于歌词、AAC-LC 和 MV，网页登录后会自动写入配置。</p>
+          <div className="service-card-title"><KeyRound /><span>Temari 解密</span></div>
+          <strong>随下载器内置</strong>
+          <p>歌词、AAC-LC 和 MV 使用 wrapper-lite 的账号，无需额外网页登录。</p>
         </Surface>
         <Surface className="service-account-card">
           <div className="service-card-title"><Server /><span>环境检查</span></div>
-          <strong>{readyCount}/4</strong>
-          <p>下载器、MP4Box、解密端口和 m3u8 端口。</p>
+          <strong>{readyCount}/3</strong>
+          <p>下载器、MP4Box 和 wrapper-lite HTTP 接口。</p>
         </Surface>
       </div>
 
@@ -228,15 +269,15 @@ export default function ServicePage() {
         <div className="ui-section-head compact">
           <div>
             <h2>运行环境</h2>
-            <p>端口没有连通时，先启动服务；工具缺失时需要检查本地依赖。</p>
+            <p>连接失败时检查服务地址和容器日志；工具缺失时检查本地依赖。</p>
           </div>
         </div>
         {s && (
           <div className="service-grid">
             <div><span>下载器</span><Check ok={s.downloader} label={s.downloader ? '就绪' : '缺失'} /></div>
             <div><span>MP4Box</span><Check ok={s.mp4box} label={s.mp4box ? '就绪' : '缺失'} /></div>
-            <div><span>解密端口 10020</span><Check ok={s.decryptPort} label={s.decryptPort ? '连通' : '未连通'} /></div>
-            <div><span>m3u8 端口 20020</span><Check ok={s.m3u8Port} label={s.m3u8Port ? '连通' : '未连通'} /></div>
+            <div><span>wrapper-lite HTTP</span><Check ok={s.wrapperApi} label={s.wrapperApi ? '连通' : '未连通'} /></div>
+            <div><span>服务地址</span><span>{s.wrapperUrl}</span></div>
           </div>
         )}
       </Surface>
@@ -244,14 +285,14 @@ export default function ServicePage() {
       <Surface className="service-log-card" padded={false}>
         <div className="service-log-head">
           <div>
-            <h2>wrapper 日志</h2>
+            <h2>wrapper-lite 日志</h2>
             <p>服务异常时看这里，正常使用时可以不用管它。</p>
           </div>
         </div>
         <LogView log={logs} height={150} />
       </Surface>
 
-      <Surface className="service-login-surface">
+      {!remote && <Surface className="service-login-surface">
         <div className="ui-section-head compact">
           <div>
             <h2>Apple ID</h2>
@@ -295,15 +336,15 @@ export default function ServicePage() {
         )}
 
         {showLoginForm && loginLog && <LogView log={loginLog} height={180} />}
-      </Surface>
+      </Surface>}
 
       <Surface>
         <div className="ui-section-head compact">
           <div>
-            <h2>media-user-token（歌词 / AAC-LC / MV 用，可选）</h2>
-            <p>登录网页后自动提取 token 并写入 config.yaml。</p>
+            <h2>电台 token（可选）</h2>
+            <p>仅下载电台时需要，网页登录后写入 station-token。普通歌曲无需设置。</p>
           </div>
-          {s && <Badge tone={s.mediaUserToken ? 'green' : 'default'}>{s.mediaUserToken ? '已配置' : '未配置'}</Badge>}
+          {s && <Badge tone={s.stationToken ? 'green' : 'default'}>{s.stationToken ? '已配置' : '未配置'}</Badge>}
         </div>
         <BrowserLoginButton onDone={refresh} showNotice={showNotice} />
       </Surface>
@@ -351,7 +392,7 @@ function BrowserLoginButton({ onDone, showNotice }: { onDone: () => void; showNo
   useEffect(() => {
     const offSaved = window.api.onMusicTokenSaved(() => {
       setWaiting(false);
-      showNotice('success', 'media-user-token 已自动保存到 config.yaml');
+      showNotice('success', '电台 station-token 已自动保存到 config.yaml');
       onDone();
     });
     const offCancel = window.api.onMusicTokenCancelled(() => setWaiting(false));

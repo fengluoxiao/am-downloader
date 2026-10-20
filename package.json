@@ -9,18 +9,28 @@
   "scripts": {
     "dev": "concurrently -k \"npm:dev:vite\" \"npm:dev:electron\"",
     "dev:vite": "vite",
-    "dev:electron": "wait-on tcp:5173 && electron . --no-sandbox",
+    "dev:electron": "wait-on tcp:5173 && node scripts/dev-electron.cjs",
     "build": "vite build",
     "dist": "vite build && electron-builder --linux deb",
-    "start": "electron . --no-sandbox",
-    "typecheck": "tsc --noEmit"
+    "start": "npm run build && electron . --no-sandbox",
+    "typecheck": "tsc --noEmit",
+    "build:downloader": "node scripts/build-downloader.cjs",
+    "test:wrapper": "node --test tests/wrapper-lite.test.cjs",
+    "test:history": "node --test tests/download-history.test.cjs",
+    "test:paths": "node --test tests/config-paths.test.cjs",
+    "test:search": "node --test tests/search-stream.test.cjs",
+    "test:search:electron": "node tests/search-stream-electron.cjs",
+    "test:paths:electron": "node tests/config-paths-electron.cjs",
+    "test:history:electron": "node tests/download-history-electron.cjs",
+    "test:wrapper:electron": "node tests/wrapper-lite-electron.cjs"
   },
   "build": {
     "appId": "com.fengluoxiao.amatmosdownloader",
     "productName": "AM Atmos Downloader",
     "files": [
       "electron/**/*",
-      "dist/**/*",
+      "dist/index.html",
+      "dist/assets/**/*",
       "package.json"
     ],
     "extraResources": [
@@ -29,6 +39,9 @@
         "to": "repo"
       }
     ],
+    "directories": {
+      "output": "release"
+    },
     "linux": {
       "target": [
         "deb"

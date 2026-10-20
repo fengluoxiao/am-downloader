@@ -28,6 +28,7 @@ export default function RecyclePage() {
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => window.api.onLibraryChanged(() => { void refresh(); }), [refresh]);
 
   const restore = async (item: RecycleItem) => {
     const res = await window.api.recycleRestore(item.id);

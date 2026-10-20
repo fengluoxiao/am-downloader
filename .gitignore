@@ -13,6 +13,7 @@ Thumbs.db
 *.snap
 *.dmg
 *.exe
+!build-res/repo/apple-music-dl.exe
 *.blockmap
 
 # Local environment
@@ -24,3 +25,4 @@ Thumbs.db
 test-results/
 playwright-report/
 screenshots/
+.cache/

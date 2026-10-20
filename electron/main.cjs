@@ -2,10 +2,14 @@ const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const { spawn, execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const net = require('net');
+const crypto = require('crypto');
 const os = require('os');
 const yaml = require('js-yaml');
 const { findAppleMusicInfo } = require('./getinfo');
+const { createSearchRunner } = require('./search-runner.cjs');
+const { DEFAULT_URL, connectionSettings, normalizeWrapperUrl, probeWrapper, migrateConfig } = require('./wrapper-lite.cjs');
+const downloadHistory = require('./download-history.cjs');
+const { mediaToolEnv } = require('./media-tools.cjs');
 
 // Hyprland 下 Electron 的 GPU compositing / GPU process 都可能在窗口创建后假死或 SIGTRAP。
 // 默认在 Hyprland 走软件渲染；AM_GUI_DISABLE_GPU=0 可关闭该兼容层；AM_GUI_OZONE=x11/wayland 可手动覆盖 ozone。
@@ -41,35 +45,36 @@ if (process.platform === 'linux') {
 
 // ---------- paths ----------
 // 打包后 config.yaml 会被写入，repo 需要落在可写的 userData 下；
-// 开发环境直接用 ../repo，打包环境首次启动时从 resources 复制模板
+// 开发和打包环境均使用配套的 HTTP/Temari 下载器，避免误用旧 TCP 二进制。
 function resolveRepoDir() {
   if (process.env.AM_DL_REPO) return process.env.AM_DL_REPO;
-  if (!app.isPackaged) {
-    const dev = path.resolve(__dirname, '..', '..', 'repo');
-    if (fs.existsSync(path.join(dev, 'apple-music-dl'))) return dev;
-  }
+  const tpl = app.isPackaged ? path.join(process.resourcesPath, 'repo') : path.resolve(__dirname, '..', 'build-res', 'repo');
   const userRepo = path.join(app.getPath('userData'), 'repo');
-  if (!fs.existsSync(path.join(userRepo, 'apple-music-dl'))) {
-    const tpl = path.join(process.resourcesPath, 'repo');
-    if (fs.existsSync(tpl)) {
-      fs.mkdirSync(userRepo, { recursive: true });
-      for (const f of fs.readdirSync(tpl)) {
-        fs.copyFileSync(path.join(tpl, f), path.join(userRepo, f));
-      }
-      try { fs.chmodSync(path.join(userRepo, 'apple-music-dl'), 0o755); } catch {}
+  fs.mkdirSync(userRepo, { recursive: true });
+  if (fs.existsSync(tpl)) {
+    for (const f of fs.readdirSync(tpl)) {
+      const target = path.join(userRepo, f);
+      // Config is user-owned. Refresh bundled binaries after an app upgrade.
+      if (f === 'config.yaml' && fs.existsSync(target)) continue;
+      const source = path.join(tpl, f);
+      if (!fs.statSync(source).isFile()) continue;
+      const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+      if (!fs.existsSync(target) || digest(source) !== digest(target)) fs.copyFileSync(source, target);
     }
+    try { fs.chmodSync(path.join(userRepo, 'apple-music-dl'), 0o755); } catch {}
   }
   return userRepo;
 }
 const REPO_DIR = resolveRepoDir();
-const BINARY = path.join(REPO_DIR, 'apple-music-dl');
+const BINARY = path.join(REPO_DIR, process.platform === 'win32' ? 'apple-music-dl.exe' : 'apple-music-dl');
 const CONFIG_PATH = path.join(REPO_DIR, 'config.yaml');
-const WRAPPER_DIR = path.join(os.homedir(), 'tools', 'wrapper');
+const WRAPPER_DIR = process.env.AM_WRAPPER_DIR || path.join(os.homedir(), 'tools', 'wrapper-lite');
 const WRAPPER_DATA = path.join(WRAPPER_DIR, 'rootfs', 'data');
-const WRAPPER_IMAGE = 'apple-music-wrapper';
-const WRAPPER_NAME = 'apple-music-wrapper';
-const TWOFA_PATH = path.join(WRAPPER_DATA, 'data', 'com.apple.android.music', 'files', '2fa.txt');
-const ACCOUNT_PROFILE_ROOT = path.join(app.getPath('userData'), 'wrapper-accounts');
+const WRAPPER_IMAGE = 'wrapper-lite:local';
+const WRAPPER_NAME = 'wrapper-lite';
+const LOGIN_NAME = 'am-wrapper-lite-login';
+const TWOFA_PATH = path.join(WRAPPER_DATA, '2fa.txt');
+const ACCOUNT_PROFILE_ROOT = path.join(app.getPath('userData'), 'wrapper-lite-accounts');
 const ACCOUNT_STATE_PATH = path.join(ACCOUNT_PROFILE_ROOT, 'state.json');
 
 let win = null;
@@ -83,25 +88,21 @@ function send(channel, payload) {
 // ---------- helpers ----------
 function execFileP(cmd, args, opts = {}) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: 15000, ...opts }, (err, stdout, stderr) => {
+    execFile(cmd, args, { timeout: 15000, env: mediaToolEnv(REPO_DIR, app.getPath('userData')), ...opts }, (err, stdout, stderr) => {
       resolve({ ok: !err, stdout: String(stdout || ''), stderr: String(stderr || ''), error: err ? String(err.message || err) : null });
     });
   });
 }
 
-function portOpen(port, host = '127.0.0.1') {
-  return new Promise((resolve) => {
-    const sock = new net.Socket();
-    sock.setTimeout(1500);
-    sock.once('connect', () => { sock.destroy(); resolve(true); });
-    sock.once('timeout', () => { sock.destroy(); resolve(false); });
-    sock.once('error', () => { sock.destroy(); resolve(false); });
-    sock.connect(port, host);
-  });
+function whichP(bin) {
+  return execFileP(process.platform === 'win32' ? 'where.exe' : 'which', [bin]).then((r) => r.ok && r.stdout.trim().length > 0);
 }
 
-function whichP(bin) {
-  return execFileP('which', [bin]).then((r) => r.ok && r.stdout.trim().length > 0);
+function wrapperConnection() { return connectionSettings(readConfigObj().obj); }
+function localOnly() {
+  if (wrapperConnection().mode === 'remote') return '远程服务请在 1Panel 中管理容器和 Apple ID 登录';
+  if (tasks.size || wrapperStartLock) return '请等待下载或服务启动结束后再操作';
+  return '';
 }
 
 function readAccountState() {
@@ -117,7 +118,8 @@ function readAccountState() {
   } catch {}
   const discovered = discoverAccountProfiles();
   if (discovered.length) return { activeId: discovered[0].id, profiles: discovered };
-  const fallback = { id: 'default', label: '默认账号', storefront: readConfigObj().obj.storefront || 'cn' };
+  const configuredStorefront = String(readConfigObj().obj.storefront || '').toLowerCase();
+  const fallback = { id: 'default', label: '默认账号', storefront: /^[a-z]{2}$/.test(configuredStorefront) ? configuredStorefront : 'cn' };
   return { activeId: fallback.id, profiles: [fallback] };
 }
 
@@ -167,11 +169,17 @@ function accountProfileDir(id) {
 }
 
 function accountHasLogin(id) {
-  return fs.existsSync(path.join(accountProfileDir(id), 'data', 'com.apple.android.music', 'files', 'mpl_db', 'kvs.sqlitedb'));
+  return hasLiteLogin(accountProfileDir(id));
 }
 
 function wrapperLoggedIn() {
-  return fs.existsSync(path.join(WRAPPER_DATA, 'data', 'com.apple.android.music', 'files', 'mpl_db', 'kvs.sqlitedb'));
+  return hasLiteLogin(WRAPPER_DATA);
+}
+
+function hasLiteLogin(dir) {
+  return ['MUSIC_TOKEN', 'DEV_TOKEN', 'STOREFRONT_ID'].every((file) => {
+    try { return fs.readFileSync(path.join(dir, file), 'utf8').trim().length > 0; } catch { return false; }
+  });
 }
 
 async function copyWrapperDataWithDocker(fromHost, toHost) {
@@ -234,6 +242,15 @@ function readConfigObj() {
     return { raw, obj: yaml.load(raw) || {} };
   } catch {
     return { raw: '', obj: {} };
+  }
+}
+
+if (fs.existsSync(CONFIG_PATH)) {
+  const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+  const migrated = migrateConfig(raw);
+  if (migrated !== raw) {
+    if (!fs.existsSync(`${CONFIG_PATH}.pre-wrapper-lite.bak`)) fs.copyFileSync(CONFIG_PATH, `${CONFIG_PATH}.pre-wrapper-lite.bak`);
+    fs.writeFileSync(CONFIG_PATH, migrated, 'utf8');
   }
 }
 
@@ -328,62 +345,79 @@ function closeSearchBrowser() {
   }
 }
 
-ipcMain.handle('search:run', async (_e, { term, storefront, type, albumFilter, offset }) => {
-  if (!term || !String(term).trim()) return { error: '搜索词不能为空', status: 400 };
-  try {
-    const page = await ensureSearchPage();
-    const payload = await findAppleMusicInfo(
-      page,
-      String(term).trim(),
-      storefront || activeAccountProfile().storefront,
-      type || 'song',
-      albumFilter || 'albumPriority',
-      Math.max(0, Number(offset) || 0)
-    );
-    // getinfo 的错误约定：数组 [{error,status}] 或对象 {error,status}
-    const err = Array.isArray(payload) ? payload[0] : (payload && payload.error ? payload : null);
-    if (err && err.error) return { error: err.error, status: err.status || 500 };
-    return { ok: true, results: payload.results || [], pagination: payload.pagination || null };
-  } catch (e) {
-    // 页面崩溃时重置浏览器，下次搜索自动重建
-    closeSearchBrowser();
-    return { error: `搜索失败: ${e.message}`, status: 500 };
-  }
+const searchRunner = createSearchRunner({
+  getPage: async () => (await ensureSearchPage()).context().newPage(),
+  search: findAppleMusicInfo,
+  getStorefront: () => activeAccountProfile().storefront,
 });
+ipcMain.handle('search:run', (event, opts) => searchRunner.run(event, opts));
+ipcMain.on('search:cancel', (event, requestId) => searchRunner.cancel(event, requestId));
 
 // ---------- IPC: status ----------
 ipcMain.handle('status:get', async () => {
-  const container = await execFileP('docker', ['ps', '--filter', `name=^${WRAPPER_NAME}$`, '--format', '{{.Status}}']);
-  const loggedIn = wrapperLoggedIn();
+  const connection = wrapperConnection();
+  const remote = connection.mode === 'remote';
+  const [health, container, mp4box, docker] = await Promise.all([
+    probeWrapper(connection.url),
+    remote ? null : execFileP('docker', ['ps', '--filter', `name=^${WRAPPER_NAME}$`, '--format', '{{.Status}}']),
+    whichP('MP4Box'), remote ? false : whichP('docker'),
+  ]);
+  const loggedIn = remote ? health.ok && health.regions.length > 0 : wrapperLoggedIn();
   const accounts = accountProfilesPayload();
   const activeAccount = accounts.find((profile) => profile.active) || accounts[0];
   return {
     repoDir: REPO_DIR,
     downloader: fs.existsSync(BINARY),
     config: fs.existsSync(CONFIG_PATH),
-    mp4box: await whichP('MP4Box'),
-    docker: await whichP('docker'),
-    wrapperRunning: container.ok && container.stdout.trim().length > 0,
-    wrapperStatusText: container.stdout.trim(),
-    decryptPort: await portOpen(10020),
-    m3u8Port: await portOpen(20020),
+    mp4box,
+    docker,
+    wrapperRunning: remote ? health.ok : Boolean(container?.ok && container.stdout.trim()),
+    wrapperStatusText: remote ? (health.ok ? '远程服务已连接' : health.error) : container.stdout.trim(),
+    wrapperApi: health.ok,
+    wrapperMode: connection.mode,
+    wrapperUrl: connection.url,
+    wrapperRegions: health.regions,
+    wrapperError: health.error,
     loggedIn,
     activeAccountId: activeAccount.id,
     activeAccountLabel: activeAccount.label,
     activeStorefront: activeAccount.storefront,
     accounts,
-    mediaUserToken: (readConfigObj().obj['media-user-token'] || '').length > 50,
+    stationToken: (readConfigObj().obj['station-token'] || '').length > 50,
   };
 });
 
+ipcMain.handle('wrapper:configure', async (_e, { mode, url }) => {
+  try {
+    if (tasks.size || loginProc || wrapperStartLock) return { ok: false, error: '请先结束下载、登录或服务启动，再修改连接' };
+    if (!['local', 'remote'].includes(mode)) throw new Error('未知连接方式');
+    const normalized = normalizeWrapperUrl(url);
+    if (mode === 'local' && normalized !== DEFAULT_URL) throw new Error(`本机 Docker 使用 ${DEFAULT_URL}，自定义地址请选择远程服务`);
+    const { raw } = readConfigObj();
+    const config = yaml.load(raw) || {};
+    config['wrapper-mode'] = mode;
+    config['wrapper-lite-url'] = normalized;
+    // Preserve comments and all other preferences.
+    let next = migrateConfig(raw);
+    for (const key of ['wrapper-mode', 'wrapper-lite-url']) next = next.replace(new RegExp(`^${key}:.*$`, 'm'), () => `${key}: ${JSON.stringify(config[key])}`);
+    fs.writeFileSync(CONFIG_PATH, next, 'utf8');
+    const health = await probeWrapper(normalized);
+    return { ok: true, connected: health.ok, error: health.error };
+  } catch (error) { return { ok: false, error: error.message }; }
+});
+
 ipcMain.handle('account:switch', async (_e, id) => {
+  const denied = localOnly();
+  if (denied) return { ok: false, error: denied };
   const state = readAccountState();
   const target = state.profiles.find((profile) => profile.id === id);
   if (!target) return { ok: false, error: '未知账号槽位' };
   if (id === activeAccountId()) return { ok: true, profiles: accountProfilesPayload() };
-  await execFileP('docker', ['rm', '-f', 'am-wrapper-login']);
-  await execFileP('docker', ['rm', '-f', WRAPPER_NAME]);
   loginProc = null;
+  for (const name of [LOGIN_NAME, WRAPPER_NAME]) {
+    const stopped = await execFileP('docker', ['rm', '-f', name]);
+    if (!stopped.ok && !/No such container/i.test(stopped.stderr)) return { ok: false, error: stopped.stderr || stopped.error };
+  }
   const saved = await saveCurrentAccountProfile();
   if (!saved.ok) return saved;
   const restored = await restoreAccountProfile(id);
@@ -394,6 +428,8 @@ ipcMain.handle('account:switch', async (_e, id) => {
 });
 
 ipcMain.handle('account:create', async (_e, { label, storefront }) => {
+  const denied = localOnly();
+  if (denied) return { ok: false, error: denied };
   const state = readAccountState();
   const sf = String(storefront || '').trim().toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 12);
   if (!sf) return { ok: false, error: '请输入账号区域，例如 cn / us / jp' };
@@ -404,6 +440,8 @@ ipcMain.handle('account:create', async (_e, { label, storefront }) => {
 });
 
 ipcMain.handle('account:delete', async (_e, id) => {
+  const denied = localOnly();
+  if (denied) return { ok: false, error: denied };
   const state = readAccountState();
   if (state.profiles.length <= 1) return { ok: false, error: '至少保留一个账号槽位' };
   const target = state.profiles.find((profile) => profile.id === id);
@@ -418,6 +456,11 @@ ipcMain.handle('account:delete', async (_e, id) => {
 let wrapperStartLock = null;
 
 ipcMain.handle('wrapper:start', async () => {
+  if (wrapperConnection().mode === 'remote') {
+    const health = await probeWrapper(wrapperConnection().url);
+    return health.ok ? { ok: true } : { ok: false, error: health.error };
+  }
+  if (loginProc) return { ok: false, error: '请先完成 Apple ID 登录' };
   if (wrapperStartLock) return wrapperStartLock;
   wrapperStartLock = (async () => {
     try {
@@ -433,48 +476,63 @@ async function startWrapperInner() {
   const loggedIn = wrapperLoggedIn();
   if (!loggedIn) return { ok: false, error: '尚未登录 Apple ID，请先在下方完成登录' };
   const existing = await execFileP('docker', ['ps', '--filter', `name=^${WRAPPER_NAME}$`, '--format', '{{.Status}}']);
-  if (existing.ok && existing.stdout.trim()) return { ok: true };
+  if (!existing.ok) return { ok: false, error: existing.stderr || existing.error };
+  if (existing.stdout.trim()) {
+    const health = await probeWrapper(DEFAULT_URL);
+    return health.ok ? { ok: true } : { ok: false, error: health.error };
+  }
   await execFileP('docker', ['rm', '-f', WRAPPER_NAME]);
   const r = await execFileP('docker', [
     'run', '-d', '--name', WRAPPER_NAME, '--privileged',
     '-v', `${WRAPPER_DATA}:/app/rootfs/data`,
-    '-p', '10020:10020', '-p', '20020:20020', '-p', '30020:30020',
+    '-p', '127.0.0.1:12340:12340',
     '--restart', 'unless-stopped',
     WRAPPER_IMAGE,
   ]);
   if (!r.ok) return { ok: false, error: r.stderr || r.error };
-  await new Promise((res) => setTimeout(res, 2500));
-  const st = await execFileP('docker', ['ps', '--filter', `name=^${WRAPPER_NAME}$`, '--format', '{{.Status}}']);
-  if (st.ok && st.stdout.trim()) return { ok: true };
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const health = await probeWrapper(DEFAULT_URL, 1000);
+    if (health.ok) return { ok: true };
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
   const logs = await execFileP('docker', ['logs', '--tail', '10', WRAPPER_NAME]);
-  return { ok: false, error: `容器启动后退出：\n${(logs.stdout + logs.stderr).trim()}` };
+  return { ok: false, error: `wrapper-lite HTTP 接口尚未就绪，请查看日志后刷新：\n${(logs.stdout + logs.stderr).trim()}` };
 }
 
 ipcMain.handle('wrapper:stop', async () => {
+  const denied = localOnly();
+  if (denied) return { ok: false, error: denied };
   const r = await execFileP('docker', ['stop', WRAPPER_NAME]);
   return r.ok ? { ok: true } : { ok: false, error: r.stderr || r.error };
 });
 
 ipcMain.handle('wrapper:logs', async () => {
+  if (wrapperConnection().mode === 'remote') return { ok: true, logs: `远程 wrapper-lite：${wrapperConnection().url}\n请在 1Panel → 容器 → wrapper-lite → 日志中查看运行日志。` };
   const r = await execFileP('docker', ['logs', '--tail', '200', WRAPPER_NAME]);
   return { ok: r.ok, logs: (r.stdout + r.stderr).trim() };
 });
 
 // ---------- IPC: login ----------
 ipcMain.handle('login:start', async (_e, { username, password }) => {
+  const denied = localOnly();
+  if (denied) return { ok: false, error: denied };
   if (loginProc) return { ok: false, error: '登录进程已在运行' };
   if (!username || !password) return { ok: false, error: '请输入 Apple ID 和密码' };
-  if (username.includes(':') || password.includes(':')) {
-    return { ok: false, error: 'wrapper 以「用户名:密码」格式解析凭据，账号或密码中不能包含英文冒号 :' };
+  if (username.includes(':')) {
+    return { ok: false, error: 'Apple ID 不能包含英文冒号 :' };
   }
-  await execFileP('docker', ['rm', '-f', 'am-wrapper-login']);
+  const stopped = await execFileP('docker', ['rm', '-f', WRAPPER_NAME]);
+  if (!stopped.ok && !/No such container/i.test(stopped.stderr)) return { ok: false, error: stopped.stderr || stopped.error };
+  await execFileP('docker', ['rm', '-f', LOGIN_NAME]);
+  fs.mkdirSync(WRAPPER_DATA, { recursive: true });
   try { fs.rmSync(TWOFA_PATH); } catch {}
-  loginProc = spawn('docker', [
-    'run', '--rm', '--privileged', '--name', 'am-wrapper-login',
+  const proc = spawn('docker', [
+    'run', '--rm', '--privileged', '--name', LOGIN_NAME,
     '-v', `${WRAPPER_DATA}:/app/rootfs/data`,
-    '--entrypoint', './wrapper', WRAPPER_IMAGE,
-    '-L', `${username}:${password}`, '-F', '-H', '0.0.0.0',
+    '--entrypoint', './wrapper-lite-rootless', WRAPPER_IMAGE,
+    '--login', `${username}:${password}`, '--code-from-file', '--base-dir', '/data',
   ]);
+  loginProc = proc;
   let buf = '';
   const sent = { tfa: false, ok: false, fail: false };
   const onData = (d) => {
@@ -482,30 +540,39 @@ ipcMain.handle('login:start', async (_e, { username, password }) => {
     send('login-log', chunk);
     buf = (buf + chunk).slice(-20000);
     if (!sent.tfa && buf.includes('Enter your 2FA code')) { sent.tfa = true; send('login-2fa-required'); }
-    if (!sent.ok && (buf.includes('StoreFront ID') || buf.includes('account info cached successfully'))) {
-      sent.ok = true;
-      saveCurrentAccountProfile().finally(() => send('login-success'));
-    }
-    if (!sent.fail && !sent.ok && (buf.includes('login failed') || buf.includes('auth error'))) { sent.fail = true; send('login-failed'); }
+    if (buf.includes('login complete, exiting')) sent.ok = true;
+    if (!sent.fail && (buf.includes('login failed') || buf.includes('auth error') || buf.includes('failed to cache account info') || buf.includes('2FA code timeout'))) { sent.fail = true; send('login-failed'); }
   };
-  loginProc.stdout.on('data', onData);
-  loginProc.stderr.on('data', onData);
-  loginProc.on('close', (code) => {
+  proc.stdout.on('data', onData);
+  proc.stderr.on('data', onData);
+  proc.on('error', (error) => {
+    send('login-log', `\n[启动失败] ${error.message}\n`);
+    sent.fail = true;
+    send('login-failed');
+  });
+  proc.on('close', async (code) => {
+    if (loginProc !== proc) return;
+    loginProc = null;
     send('login-log', `\n[进程退出，代码 ${code}]\n`);
     send('login-exit', code);
-    loginProc = null;
+    if (code === 0 && sent.ok && !sent.fail && wrapperLoggedIn()) {
+      const saved = await saveCurrentAccountProfile();
+      if (!saved.ok) send('login-log', `\n[账号备份失败] ${saved.error}\n`);
+      send('login-success');
+    } else if (!sent.fail) send('login-failed');
   });
   return { ok: true };
 });
 
 ipcMain.handle('login:2fa', async (_e, code) => {
+  if (wrapperConnection().mode === 'remote' || !loginProc) return { ok: false, error: '当前没有本机登录进程，远程验证码请在 1Panel 服务器提交' };
   const c = String(code || '').trim();
   if (!/^\d{6}$/.test(c)) return { ok: false, error: '请输入 6 位数字验证码' };
   // 数据目录在容器内属 root，直接写会 EACCES，改为在容器里写入
-  const containerPath = '/app/rootfs/data/data/com.apple.android.music/files/2fa.txt';
+  const containerPath = '/app/rootfs/data/2fa.txt';
   const r = await execFileP('docker', [
-    'exec', 'am-wrapper-login', 'sh', '-c',
-    `mkdir -p '${path.dirname(containerPath)}' && printf %s '${c}' > '${containerPath}'`,
+    'exec', LOGIN_NAME, 'sh', '-c',
+    `printf %s '${c}' > '${containerPath}'`,
   ]);
   if (r.ok) return { ok: true };
   // 兜底：容器可能刚好退出，尝试直接写（目录属主为当前用户时可用）
@@ -518,9 +585,11 @@ ipcMain.handle('login:2fa', async (_e, code) => {
 });
 
 ipcMain.handle('login:stop', async () => {
-  if (loginProc) { try { loginProc.kill('SIGTERM'); } catch {} }
-  await execFileP('docker', ['rm', '-f', 'am-wrapper-login']);
+  if (wrapperConnection().mode === 'remote') return { ok: true };
+  const proc = loginProc;
   loginProc = null;
+  if (proc) { try { proc.kill('SIGTERM'); } catch {} }
+  await execFileP('docker', ['rm', '-f', LOGIN_NAME]);
   return { ok: true };
 });
 
@@ -529,9 +598,9 @@ let tokenWin = null;
 
 function saveMediaUserToken(token) {
   const { raw } = readConfigObj();
-  const line = `media-user-token: "${token.replace(/"/g, '\\"')}"`;
-  const next = /^media-user-token:.*$/m.test(raw)
-    ? raw.replace(/^media-user-token:.*$/m, line)
+  const line = `station-token: ${JSON.stringify(token)}`;
+  const next = /^station-token:.*$/m.test(raw)
+    ? raw.replace(/^station-token:.*$/m, () => line)
     : `${line}\n${raw}`;
   fs.writeFileSync(CONFIG_PATH, next, 'utf8');
 }
@@ -571,10 +640,15 @@ ipcMain.handle('musictoken:open', async () => {
 });
 
 // ---------- IPC: downloads ----------
-ipcMain.handle('download:start', (_e, opts) => {
+ipcMain.handle('download:start', async (_e, opts) => {
   const { urls, mode, song, debug, select } = opts;
   if (!fs.existsSync(BINARY)) return { ok: false, error: `下载器不存在: ${BINARY}` };
-  const args = [];
+  if (loginProc || wrapperStartLock) return { ok: false, error: '请等待登录或服务启动完成' };
+  const health = await probeWrapper(wrapperConnection().url);
+  if (!health.ok) return { ok: false, error: health.error };
+  if (!health.regions.length) return { ok: false, error: 'wrapper-lite 尚未登录，请先完成 Apple ID 登录' };
+  if (!await whichP('MP4Box')) return { ok: false, error: '本机缺少 MP4Box，无法封装或写入歌曲标签。请安装 GPAC 后重试；远程 wrapper 无需修改。' };
+  const args = ['--json'];
   if (mode === 'atmos') args.push('--atmos');
   else if (mode === 'aac') args.push('--aac');
   if (song) args.push('--song');
@@ -583,14 +657,20 @@ ipcMain.handle('download:start', (_e, opts) => {
   for (const u of urls) args.push(u);
 
   const id = `t${Date.now()}${Math.floor(Math.random() * 1000)}`;
-  const env = { ...process.env, PATH: `${path.join(os.homedir(), '.cargo', 'bin')}:${process.env.PATH}` };
-  const proc = spawn(BINARY, args, { cwd: REPO_DIR, env, detached: true });
+  const env = mediaToolEnv(REPO_DIR, app.getPath('userData'));
+  const proc = spawn(BINARY, args, { cwd: REPO_DIR, env, detached: process.platform !== 'win32', windowsHide: true });
   tasks.set(id, proc);
-  proc.stdout.on('data', (d) => send('dl-log', { id, chunk: String(d) }));
+  let output = '';
+  proc.stdout.setEncoding('utf8');
+  proc.stderr.setEncoding('utf8');
+  proc.stdout.on('data', (d) => {
+    output = (output + String(d)).slice(-16 * 1024 * 1024);
+    send('dl-log', { id, chunk: String(d) });
+  });
   proc.stderr.on('data', (d) => send('dl-log', { id, chunk: String(d) }));
   proc.on('close', (code) => {
     tasks.delete(id);
-    send('dl-exit', { id, code });
+    send('dl-exit', { id, code, downloaded: downloadHistory.receipts(output, opts, REPO_DIR) });
   });
   proc.on('error', (err) => {
     tasks.delete(id);
@@ -782,14 +862,39 @@ ipcMain.handle('files:list', () => {
 
 ipcMain.handle('files:roots', () => normalizeFileRoots());
 
+ipcMain.handle('download:reconcile', (_e, items, histories) => {
+  const recycle = readRecycleIndex();
+  const inventory = [];
+  if (items.some((item) => !Array.isArray(item.files))) {
+    const modeFor = (format) => format === 'ALAC' ? 'alac' : format === 'AAC' ? 'aac' : 'atmos';
+    for (const root of downloadRoots()) {
+      const found = [];
+      walkAudio(root.dir, root.format, found, 0);
+      inventory.push(...found.map((f) => ({ path: f.path, mode: modeFor(root.format) })));
+    }
+    for (const item of recycle) {
+      const root = downloadRoots().find((r) => downloadHistory.inside(r.dir, item.originalPath));
+      if (!root) continue;
+      if (item.type === 'file') {
+        if (AUDIO_EXTS.has(path.extname(item.originalPath).toLowerCase())) inventory.push({ path: item.originalPath, mode: modeFor(root.format) });
+      } else {
+        const found = [];
+        walkAudio(item.trashPath, root.format, found, 0);
+        inventory.push(...found.map((f) => ({ path: path.join(item.originalPath, path.relative(item.trashPath, f.path)), mode: modeFor(root.format) })));
+      }
+    }
+  }
+  return downloadHistory.reconcile(items, recycle, inventory, histories);
+});
+
 ipcMain.handle('files:readDir', (_e, target) => {
   const { roots, root, dir } = resolveBrowserPath(target);
   if (!root || !dir) return { ok: true, roots, root: null, path: '', parent: null, entries: [] };
-  fs.mkdirSync(root.path, { recursive: true });
   const relToRoot = path.relative(root.path, dir);
   const parent = relToRoot ? path.dirname(dir) : null;
   let entries = [];
   try {
+    fs.mkdirSync(root.path, { recursive: true });
     entries = fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
       try {
         const p = path.join(dir, e.name);
@@ -849,6 +954,7 @@ ipcMain.handle('files:delete', (_e, target) => {
     const items = readRecycleIndex();
     items.unshift(item);
     writeRecycleIndex(items);
+    send('library-changed', {});
     return { ok: true, item };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
@@ -861,6 +967,7 @@ ipcMain.handle('files:copy', (_e, target, destDir) => {
     fs.mkdirSync(destDir, { recursive: true });
     const dest = uniqueDestination(destDir, path.basename(target));
     copyRecursive(target, dest);
+    send('library-changed', { kind: 'copy', from: target, to: dest });
     return { ok: true, path: dest };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
@@ -877,6 +984,7 @@ ipcMain.handle('files:move', (_e, target, destDir) => {
       copyRecursive(target, dest);
       fs.rmSync(target, { recursive: true, force: true });
     }
+    send('library-changed', { kind: 'move', from: target, to: dest });
     return { ok: true, path: dest };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
@@ -905,6 +1013,7 @@ ipcMain.handle('recycle:restore', (_e, id) => {
     const dest = fs.existsSync(item.originalPath) ? uniqueDestination(parent, item.name) : item.originalPath;
     movePath(item.trashPath, dest);
     writeRecycleIndex(items.filter((x) => x.id !== id));
+    send('library-changed', { kind: 'move', from: item.originalPath, to: dest });
     return { ok: true, path: dest };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
@@ -918,6 +1027,7 @@ ipcMain.handle('recycle:purge', (_e, id) => {
   try {
     fs.rmSync(item.trashPath, { recursive: true, force: true });
     writeRecycleIndex(items.filter((x) => x.id !== id));
+    send('library-changed', {});
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
@@ -932,6 +1042,8 @@ ipcMain.handle('recycle:empty', () => {
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
+  } finally {
+    send('library-changed', {});
   }
 });
 
@@ -961,8 +1073,11 @@ ipcMain.handle('config:read', () => {
 
 ipcMain.handle('config:write', (_e, raw) => {
   try {
-    yaml.load(raw); // validate
-    fs.writeFileSync(CONFIG_PATH, raw, 'utf8');
+    if (tasks.size || loginProc || wrapperStartLock) throw new Error('请先结束下载、登录或服务启动，再修改配置');
+    const migrated = migrateConfig(raw);
+    const connection = connectionSettings(yaml.load(migrated) || {});
+    if (connection.mode === 'local' && connection.url !== DEFAULT_URL) throw new Error('自定义服务地址需要选择远程服务模式');
+    fs.writeFileSync(CONFIG_PATH, migrated, 'utf8');
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
