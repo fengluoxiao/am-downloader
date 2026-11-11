@@ -9,7 +9,7 @@ function mediaToolEnv(repoDir, userDataDir, base = process.env, platform = proce
   const pathKeys = Object.keys(env).filter((key) => windows ? key.toLowerCase() === 'path' : key === 'PATH');
   const inherited = pathKeys.map((key) => env[key]).filter(Boolean);
   for (const key of pathKeys) delete env[key];
-  const dirs = [paths.join(userDataDir, 'tools', 'gpac'), repoDir];
+  const dirs = [paths.join(userDataDir, 'tools', 'gpac'), paths.join(userDataDir, 'tools', 'ffmpeg'), repoDir];
   if (windows) {
     for (const key of ['ProgramW6432', 'ProgramFiles', 'ProgramFiles(x86)']) {
       if (base[key]) dirs.push(paths.join(base[key], 'GPAC'));

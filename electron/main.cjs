@@ -357,10 +357,11 @@ ipcMain.on('search:cancel', (event, requestId) => searchRunner.cancel(event, req
 ipcMain.handle('status:get', async () => {
   const connection = wrapperConnection();
   const remote = connection.mode === 'remote';
-  const [health, container, mp4box, docker] = await Promise.all([
+  const [health, container, mp4box, docker, ffmpeg] = await Promise.all([
     probeWrapper(connection.url),
     remote ? null : execFileP('docker', ['ps', '--filter', `name=^${WRAPPER_NAME}$`, '--format', '{{.Status}}']),
     whichP('MP4Box'), remote ? false : whichP('docker'),
+    whichP(readConfigObj().obj['ffmpeg-path'] || 'ffmpeg'),
   ]);
   const loggedIn = remote ? health.ok && health.regions.length > 0 : wrapperLoggedIn();
   const accounts = accountProfilesPayload();
@@ -370,6 +371,7 @@ ipcMain.handle('status:get', async () => {
     downloader: fs.existsSync(BINARY),
     config: fs.existsSync(CONFIG_PATH),
     mp4box,
+    ffmpeg,
     docker,
     wrapperRunning: remote ? health.ok : Boolean(container?.ok && container.stdout.trim()),
     wrapperStatusText: remote ? (health.ok ? '远程服务已连接' : health.error) : container.stdout.trim(),
@@ -648,6 +650,7 @@ ipcMain.handle('download:start', async (_e, opts) => {
   if (!health.ok) return { ok: false, error: health.error };
   if (!health.regions.length) return { ok: false, error: 'wrapper-lite 尚未登录，请先完成 Apple ID 登录' };
   if (!await whichP('MP4Box')) return { ok: false, error: '本机缺少 MP4Box，无法封装或写入歌曲标签。请安装 GPAC 后重试；远程 wrapper 无需修改。' };
+  if (!await whichP(readConfigObj().obj['ffmpeg-path'] || 'ffmpeg')) return { ok: false, error: '本机缺少 FFmpeg，无法进行整首音频校验。请安装 FFmpeg 或设置 ffmpeg-path 后重试。' };
   const args = ['--json'];
   if (mode === 'atmos') args.push('--atmos');
   else if (mode === 'aac') args.push('--aac');

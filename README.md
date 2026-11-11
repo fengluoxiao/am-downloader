@@ -31,6 +31,7 @@ This application stands on top of these projects:
 - Node.js 20 or newer.
 - A logged-in wrapper-lite HTTP service (default `http://127.0.0.1:12340`). Docker is required only when managing the service on this computer.
 - MP4Box available in `PATH`.
+- FFmpeg available in `PATH`, or configured with `ffmpeg-path`, for mandatory full-track audio verification.
 - A valid Apple Music subscription for the account used with the wrapper.
 
 MP4Box runs on the computer running this desktop app, including when wrapper-lite is on a 1Panel server. On Windows, install [GPAC](https://gpac.io/downloads/) (for example, `winget install --id GPAC.GPAC --exact`). The app also checks the standard `Program Files/GPAC` directories and its own `tools/gpac` directory inside the app user data folder. A portable copy must include MP4Box's supporting DLLs. Dependency checks and download processes use the same search path; missing MP4Box is reported before downloading begins.
@@ -44,6 +45,12 @@ For local Docker management, build the image as `wrapper-lite:local`. The app us
 ```
 
 Both development and packaged builds copy the bundled downloader into the writable app user data directory and refresh its binary on upgrades, preserving configuration. `AM_DL_REPO` can point to an external directory containing a compatible HTTP/Temari downloader and `config.yaml`. Windows uses `apple-music-dl.exe`; Linux uses `apple-music-dl` (bundled builds target x86_64).
+
+Before embedding cover art and writing metadata, MP4Box remuxes downloaded audio into a flat MP4 with a supported major brand. It copies the compressed samples without re-encoding, preserving Dolby Atmos audio while avoiding `unsupported ftyp: 69736f35` (`iso5`) errors.
+
+ALAC and Dolby Atmos downloads check the encryption key for every fragment, including tracks that switch from the shared prefetch key after two fragments (around 30 seconds). Templates stay alive until all concurrent decrypt workers finish. Missing or truncated fragments fail the download. Files already corrupted by the older downloader need to be downloaded again; changing their tags cannot restore the audio.
+
+Before publishing a song or reporting it as downloaded, the downloader decodes the entire audio with FFmpeg, checks for decode errors and compares the decoded duration with the catalog duration (allowing one second for padding and rounding). This check also runs when an existing file is reused. A missing decoder or a failed check is an error, and no success receipt is issued. FFmpeg reads the file without changing or re-encoding the saved audio. Windows also searches `tools/ffmpeg` inside the app user data folder; `winget install --id Gyan.FFmpeg --exact` is another installation option.
 
 Old TCP connection keys are migrated automatically, with the original configuration backed up as `config.yaml.pre-wrapper-lite.bak`. New local accounts use `wrapper-lite-accounts`; sign in again rather than reusing old wrapper sessions.
 
@@ -61,7 +68,11 @@ On PowerShell systems that block `npm.ps1`, use `npm.cmd i`. To rebuild the bund
 npm run build:downloader
 ```
 
-The script tests the HTTP client and Temari decryption against upstream golden vectors before building. `AM_GO` can specify a Go executable; standard Go settings such as `GOPROXY` are respected. The source revision and binary SHA-256 hashes are recorded in `build-res/repo/downloader-version.json`.
+The script tests the HTTP client, Temari decryption golden vectors, delayed/repeated key rotation, incomplete media rejection, staged output and TTML lyrics conversion before building. The lyrics patch tolerates missing optional translation metadata and returns errors for incomplete TTML so a lyrics failure does not abort the audio download. `AM_GO` can specify a Go executable; standard Go settings such as `GOPROXY` are respected. The source revision and binary SHA-256 hashes are recorded in `build-res/repo/downloader-version.json`.
+
+Set `AM_TEST_MP4BOX` to the MP4Box executable to also run remux and metadata integration tests, including `iso5` input, Dolby/JOC configuration and compressed sample preservation, cover art, lyrics, and concurrent tagging.
+
+Set `AM_TEST_FFMPEG` to a FFmpeg executable to run real ALAC and E-AC-3 full-decode tests, including corruption near the end of a song and truncated but otherwise decodable audio.
 
 Run in development mode:
 

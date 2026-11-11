@@ -182,7 +182,7 @@ export default function ServicePage() {
   const s = status;
   const readyCount = useMemo(() => {
     if (!s) return 0;
-    return [s.downloader, s.mp4box, s.wrapperApi].filter(Boolean).length;
+    return [s.downloader, s.mp4box, s.ffmpeg, s.wrapperApi].filter(Boolean).length;
   }, [s]);
   const showLoginForm = Boolean(s && !s.loggedIn) || showCredentialLogin || logging || need2fa;
   const remote = s?.wrapperMode === 'remote';
@@ -260,8 +260,8 @@ export default function ServicePage() {
         </Surface>
         <Surface className="service-account-card">
           <div className="service-card-title"><Server /><span>环境检查</span></div>
-          <strong>{readyCount}/3</strong>
-          <p>下载器、MP4Box 和 wrapper-lite HTTP 接口。</p>
+          <strong>{readyCount}/4</strong>
+          <p>下载器、MP4Box、音频校验和 wrapper-lite HTTP 接口。</p>
         </Surface>
       </div>
 
@@ -276,6 +276,7 @@ export default function ServicePage() {
           <div className="service-grid">
             <div><span>下载器</span><Check ok={s.downloader} label={s.downloader ? '就绪' : '缺失'} /></div>
             <div><span>MP4Box</span><Check ok={s.mp4box} label={s.mp4box ? '就绪' : '缺失'} /></div>
+            <div><span>整首音频校验</span><Check ok={s.ffmpeg} label={s.ffmpeg ? '就绪' : '缺少 FFmpeg'} /></div>
             <div><span>wrapper-lite HTTP</span><Check ok={s.wrapperApi} label={s.wrapperApi ? '连通' : '未连通'} /></div>
             <div><span>服务地址</span><span>{s.wrapperUrl}</span></div>
           </div>

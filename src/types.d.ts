@@ -3,6 +3,7 @@ export interface Status {
   downloader: boolean;
   config: boolean;
   mp4box: boolean;
+  ffmpeg: boolean;
   docker: boolean;
   wrapperRunning: boolean;
   wrapperStatusText: string;
